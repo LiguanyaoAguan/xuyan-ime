@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 WORK="${WORK:-$HOME/vim-build}"
 DIST_OUT="$ROOT/dist"
 VER="1.0.0"
-APK="VoiceIME-${VER}-debug.apk"
+APK="Xuyan-${VER}.apk"
 
 export PREFIX="${PREFIX:-/data/data/com.dsharnessmobile.shell/files/usr}"
 export PATH="$PREFIX/lib/jvm/java-21-openjdk/bin:$PREFIX/bin:/system/bin"

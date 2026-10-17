@@ -25,7 +25,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 /**
- * 序言 · 语音控制中心（v3.3 视觉版）
+ * 序言 · 语音控制中心（v1.0）
  *
  * 三栏：导航 / 内容 / 胶囊预览。内容区限宽居中，避免平板上一行拉太长。
  * 视觉：深色分层 + 品牌蓝；胶囊本身样式完全不改。
@@ -146,7 +146,7 @@ public class MainActivity extends Activity {
         navBox.addView(logo);
 
         TextView ver = new TextView(this);
-        ver.setText("Xuyan · v3.3");
+        ver.setText("Xuyan · v1.0");
         ver.setTextColor(SUB);
         ver.setTextSize(11);
         ver.setPadding(dp(22), 0, dp(12), dp(24));
@@ -248,7 +248,7 @@ public class MainActivity extends Activity {
         for (int i = 0; i < navItems.length; i++) {
             boolean on = i == idx;
             navItems[i].setTextColor(on ? TEXT : SUB);
-            navItems[i].setBackgroundColor(on ? CARD : 0x00000000);
+            navItems[i].setBackground(on ? roundBg(0xFF2A3546, 10) : null);
             navItems[i].setTypeface(Typeface.create(Typeface.DEFAULT,
                     on ? Typeface.BOLD : Typeface.NORMAL));
         }
@@ -271,21 +271,65 @@ public class MainActivity extends Activity {
 
     private void pageOverview() {
         bigTitle("运行状态", "一眼看清现在能不能用");
-        buildStatusGrid();
+
+        LinearLayout two = new LinearLayout(this);
+        two.setOrientation(LinearLayout.HORIZONTAL);
+        two.setPadding(0, dp(4), 0, 0);
+
+        // 左栏：四项状态
+        LinearLayout left = new LinearLayout(this);
+        left.setOrientation(LinearLayout.VERTICAL);
+        buildStatusGridInto(left);
+
+        View gap = new View(this);
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(dp(16), 1);
+        two.addView(left, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f));
+        two.addView(gap, glp);
+
+        // 右栏：面板预览（用 VoicePadView 真实绘制面板态）
+        LinearLayout right = new LinearLayout(this);
+        right.setOrientation(LinearLayout.VERTICAL);
+        right.setBackground(roundBg(CARD, 16));
+        right.setPadding(dp(18), dp(16), dp(18), dp(16));
+
+        TextView rt = new TextView(this);
+        rt.setText("展开面板");
+        rt.setTextColor(TEXT);
+        rt.setTextSize(13);
+        rt.setTypeface(Typeface.DEFAULT_BOLD);
+        right.addView(rt);
+
+        TextView rd = new TextView(this);
+        rd.setText("点胶囊上的 ⌃ 展开");
+        rd.setTextColor(SUB);
+        rd.setTextSize(10);
+        rd.setPadding(0, dp(4), 0, dp(12));
+        right.addView(rd);
+
+        FrameLayout ph = new FrameLayout(this);
+        int pw = (int) (VoicePadView.PW * getResources().getDisplayMetrics().density);
+        int phh = (int) (VoicePadView.PH * getResources().getDisplayMetrics().density);
+        VoicePadView panelPreview = new VoicePadView(this);
+        ph.addView(panelPreview, new FrameLayout.LayoutParams(pw, phh));
+        right.addView(ph);
+
+        two.addView(right, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        contentBox.addView(two);
 
         sub("快捷操作");
-        View r1 = primaryButton("切换到本输入法", v -> {
+        contentBox.addView(primaryButton("切换到本输入法", v -> {
             try {
                 InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
                 if (imm != null) imm.showInputMethodPicker();
             } catch (Throwable e) { toast("切换失败：" + e.getMessage()); }
-        });
-        contentBox.addView(r1, matchWide());
+        }));
         note("切到本输入法后，点任意输入框就会出现胶囊。");
     }
 
     /** 2×2 状态卡片，区分「文件存在 / 已加载 / 已启用 / 正在运行」 */
-    private void buildStatusGrid() {
+    private void buildStatusGridInto(LinearLayout host) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
 
@@ -315,7 +359,7 @@ public class MainActivity extends Activity {
         lp2.topMargin = dp(6);
         row.addView(c1, lp1);
         row.addView(c2, new LinearLayout.LayoutParams(lp2));
-        contentBox.addView(row);
+        host.addView(row);
 
         LinearLayout row2 = new LinearLayout(this);
         row2.setOrientation(LinearLayout.HORIZONTAL);
@@ -328,22 +372,27 @@ public class MainActivity extends Activity {
         lp4.topMargin = dp(10);
         row2.addView(c3, lp3);
         row2.addView(c4, lp4);
-        contentBox.addView(row2);
+        host.addView(row2);
 
         // 流式草稿单独一行（它最容易误读成"已就绪"）
         String flow;
         boolean flowOk = st.modelPresent();
         if (!flowOk) flow = "未安装 · 不会边说边出字";
         else flow = st.isReady() ? "已加载 · 说话时会实时出草稿" : "文件已就位 · 首次使用会加载";
-        sub("流式草稿");
-        note(flow);
+        TextView fl = new TextView(this);
+        fl.setText("流式草稿：" + flow);
+        fl.setTextColor(SUB);
+        fl.setTextSize(11);
+        fl.setLineSpacing(0, 1.4f);
+        fl.setPadding(dp(2), dp(12), 0, 0);
+        host.addView(fl);
     }
 
     private LinearLayout statusCard(String name, String value, boolean ok, String hint) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setBackgroundColor(CARD);
-        box.setPadding(dp(16), dp(14), dp(16), dp(14));
+        box.setBackground(roundBg(CARD, 16));
+        box.setPadding(dp(20), dp(18), dp(20), dp(18));
 
         TextView n = new TextView(this);
         n.setText(name);
@@ -530,8 +579,8 @@ public class MainActivity extends Activity {
         t.setTextColor(TEXT);
         t.setTextSize(14);
         t.setLineSpacing(0, 1.5f);
-        t.setBackgroundColor(CARD);
-        t.setPadding(dp(18), dp(16), dp(18), dp(16));
+        t.setBackground(roundBg(CARD, 16));
+        t.setPadding(dp(20), dp(18), dp(20), dp(18));
         contentBox.addView(t, lp());
         return t;
     }
@@ -548,16 +597,23 @@ public class MainActivity extends Activity {
 
     private Button primaryButton(String text, View.OnClickListener l) {
         Button b = baseButton(text, l);
-        b.setBackgroundColor(BRAND);
+        b.setBackground(roundBg(BRAND, 12));
         b.setTextColor(0xFF06121F);
         b.setTextSize(15);
         b.setTypeface(Typeface.DEFAULT_BOLD);
+        // 不拉满整行：宽度随内容，最小 220dp
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(8);
+        b.setLayoutParams(lp);
+        b.setMinWidth(dp(220));
+        b.setPadding(dp(28), dp(13), dp(28), dp(13));
         return b;
     }
 
     private Button subtleButton(String text, View.OnClickListener l) {
         Button b = baseButton(text, l);
-        b.setBackgroundColor(CARD2);
+        b.setBackground(roundBg(CARD2, 12));
         b.setTextColor(TEXT);
         b.setTextSize(13);
         return b;
@@ -759,6 +815,15 @@ public class MainActivity extends Activity {
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
+
+    /** 圆角纯色背景（不用 XML，直接代码生成） */
+    private android.graphics.drawable.GradientDrawable roundBg(int color, float radiusDp) {
+        android.graphics.drawable.GradientDrawable d =
+                new android.graphics.drawable.GradientDrawable();
+        d.setColor(color);
+        d.setCornerRadius(radiusDp * getResources().getDisplayMetrics().density);
+        return d;
+    }
 
     private int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
