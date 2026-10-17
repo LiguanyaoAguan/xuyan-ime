@@ -50,6 +50,25 @@ public class AsrEngine {
 
     private static AsrEngine INSTANCE;
 
+    /** 可选语言：auto 让模型自己判断，其余强制指定（SenseVoice 支持中英日韩粤） */
+    public static final String[] LANGS = {"auto", "zh", "en", "ja", "ko", "yue"};
+    private volatile String language = "zh";
+
+    public String language() { return language; }
+
+    public void setLanguage(String l) {
+        if (l == null || l.isEmpty()) return;
+        if (l.equals(language)) return;
+        language = l;
+        reload();
+    }
+
+    /** 换语言/换模型后重新加载（release + warmUp） */
+    public synchronized void reload() {
+        release();
+        warmUp();
+    }
+
     private final Context ctx;
     private volatile OfflineRecognizer rec;
     private volatile boolean loading;
@@ -121,7 +140,7 @@ public class AsrEngine {
 
         OfflineSenseVoiceModelConfig sv = new OfflineSenseVoiceModelConfig(
                 model,          // model
-                "zh",           // language：auto 也可，zh 更稳
+                language,       // language：auto / zh / en / ja / ko / yue
                 true,           // useInverseTextNormalization：把「二零二六」规整成「2026」
                 new QnnConfig("", "", ""));
 

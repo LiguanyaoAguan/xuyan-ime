@@ -393,6 +393,32 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
         }
     }
 
+    /**
+     * 面板里的「语言」：在 auto → zh → en → ja → ko → yue 之间循环。
+     * 立即生效（重建识别器约 1 秒）；非中文时自动关掉流式草稿，
+     * 因为流式模型只有中文，硬跑只会出乱码。
+     */
+    @Override
+    public void onToggleLanguage() {
+        AsrEngine e = AsrEngine.get(this);
+        String[] langs = AsrEngine.LANGS;
+        int idx = 0;
+        for (int i = 0; i < langs.length; i++) if (langs[i].equals(e.language())) idx = i;
+        String next = langs[(idx + 1) % langs.length];
+        e.setLanguage(next);
+
+        String name;
+        switch (next) {
+            case "auto": name = "自动判断"; break;
+            case "zh": name = "中文"; break;
+            case "en": name = "English"; break;
+            case "ja": name = "日本語"; break;
+            case "ko": name = "한국어"; break;
+            default: name = "粵語"; break;
+        }
+        toast("识别语言：" + name + (("zh".equals(next) || "auto".equals(next)) ? "" : "（草稿已暂停）"));
+    }
+
     /** 面板里的「剪贴板」：把剪贴板内容直接粘到输入框 */
     @Override
     public void onPasteClipboard() {
@@ -664,7 +690,9 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
 
         // ---- 流式草稿（边说边出字）----
         StreamingAsr st = StreamingAsr.get(this);
-        streamingOn = !AsrSettings.isCloud(this) && st.modelPresent();
+        String lang = AsrEngine.get(this).language();
+        boolean langOk = "zh".equals(lang) || "auto".equals(lang);
+        streamingOn = !AsrSettings.isCloud(this) && st.modelPresent() && langOk;
         draftTarget = "";
         draftShown = 0;
         draftWritten = 0;

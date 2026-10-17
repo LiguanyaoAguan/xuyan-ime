@@ -41,6 +41,7 @@ public class VoicePadView extends View {
         void onUndoLast();       // 面板里的“撤销”：撤掉上一次上屏
         void onOpenSettings();   // 面板里的“设置”
         void onPasteClipboard(); // 面板里的“剪贴板”
+        void onToggleLanguage(); // 面板里的“语言”
         void onMoveTo(int x, int y);          // 窗口左上角（屏幕坐标 px）
         void onMoveEnd(int x, int y);
     }
@@ -230,9 +231,11 @@ public class VoicePadView extends View {
     protected void onDraw(Canvas c) {
         layoutSlots();
         boolean panel = isPanel();
-        float r = panel ? dp(PR) : getHeight() / 2f;
+        float r = panel ? dp(PR) : (getHeight() - dp(2)) / 2f;
 
-        RectF shell = new RectF(0, 0, getWidth(), getHeight());
+        // 底板往里收 1.5dp：系统对悬浮窗有圆角裁剪，画到边缘会在弧外露出灰边
+        float inset = dp(panel ? 1.5f : 1.0f);
+        RectF shell = new RectF(inset, inset, getWidth() - inset, getHeight() - inset);
         fill.setColor(C_BG);
         c.drawRoundRect(shell, r, r, fill);
         stroke.setStrokeWidth(dp(1));
@@ -294,10 +297,10 @@ public class VoicePadView extends View {
     /** L2 面板：2×2 功能格 + 右上角收起 */
     private void drawPanel(Canvas c) {
         float rad = dp(11);
-        drawCell(c, cell1, "↶", "撤销", true, rad);
-        drawCell(c, cell2, "▤", "剪贴板", true, rad);
-        drawCell(c, cell3, "文", "语言", false, rad);
-        drawCell(c, cell4, "⚙", "设置", true, rad);
+        drawCell(c, cell1, ICON_UNDO, "撤销", true, rad);
+        drawCell(c, cell2, ICON_CLIP, "剪贴板", true, rad);
+        drawCell(c, cell3, ICON_LANG, "语言", true, rad);
+        drawCell(c, cell4, ICON_GEAR, "设置", true, rad);
 
         // 右上角收起（从面板回到胶囊）
         stroke.setStrokeWidth(dp(2));
@@ -307,7 +310,10 @@ public class VoicePadView extends View {
         c.drawLine(cx, cy + k * 0.6f, cx + k, cy - k * 0.4f, stroke);
     }
 
-    private void drawCell(Canvas c, RectF box, String glyph, String label,
+    // 面板图标类型（全部 Canvas 手绘，不依赖系统字体，避免出现豆腐块/灰点）
+    private static final int ICON_UNDO = 0, ICON_CLIP = 1, ICON_LANG = 2, ICON_GEAR = 3;
+
+    private void drawCell(Canvas c, RectF box, int icon, String label,
                           boolean enabled, float rad) {
         fill.setColor(pressed == cellIndex(box) ? 0x1FFFFFFF : 0x10FFFFFF);
         c.drawRoundRect(box, rad, rad, fill);
@@ -315,16 +321,65 @@ public class VoicePadView extends View {
         stroke.setColor(0x14FFFFFF);
         c.drawRoundRect(box, rad, rad, stroke);
 
+        int col = enabled ? C_BTN : 0xFF5A6270;
+        drawCellIcon(c, icon, box.centerX(), box.top + dp(20), dp(15), col);
+
         TextPaint t = text;
         t.setTypeface(Typeface.DEFAULT);
         t.setTextAlign(Paint.Align.CENTER);
-        t.setTextSize(dp(15));
-        t.setColor(enabled ? C_BTN : 0xFF5A6270);
-        c.drawText(glyph, box.centerX(), box.top + dp(21), t);
         t.setTextSize(dp(11));
-        t.setColor(enabled ? C_BTN : 0xFF5A6270);
-        c.drawText(label, box.centerX(), box.top + dp(38), t);
+        t.setColor(col);
+        c.drawText(label, box.centerX(), box.top + dp(40), t);
         t.setTextAlign(Paint.Align.LEFT);
+    }
+
+    /** 四种小图标：撤销 / 剪贴板 / 语言 / 设置 */
+    private void drawCellIcon(Canvas c, int type, float cx, float cy, float size, int color) {
+        float k = size / 24f;
+        float l = cx - 12f * k, t = cy - 12f * k;
+        stroke.setStrokeWidth(2.0f * k);
+        stroke.setColor(color);
+        stroke.setStrokeCap(Paint.Cap.ROUND);
+        fill.setColor(color);
+
+        switch (type) {
+            case ICON_UNDO: {   // 逆时针弧 + 箭头
+                c.drawArc(new RectF(l + 5f * k, t + 6f * k, l + 19f * k, t + 20f * k),
+                        30f, -260f, false, stroke);
+                c.drawLine(l + 5f * k, t + 6f * k, l + 5f * k, t + 12f * k, stroke);
+                c.drawLine(l + 5f * k, t + 6f * k, l + 11f * k, t + 6f * k, stroke);
+                break;
+            }
+            case ICON_CLIP: {   // 剪贴板：板 + 顶部夹子 + 两行字
+                RectF body = new RectF(l + 5f * k, t + 5f * k, l + 19f * k, t + 21f * k);
+                c.drawRoundRect(body, 2.5f * k, 2.5f * k, stroke);
+                c.drawRoundRect(new RectF(l + 9f * k, t + 2f * k, l + 15f * k, t + 7f * k),
+                        1.5f * k, 1.5f * k, stroke);
+                c.drawLine(l + 8f * k, t + 11f * k, l + 16f * k, t + 11f * k, stroke);
+                c.drawLine(l + 8f * k, t + 15f * k, l + 14f * k, t + 15f * k, stroke);
+                break;
+            }
+            case ICON_LANG: {   // 地球样式：圆 + 竖椭圆 + 横线
+                c.drawCircle(cx, cy, 9f * k, stroke);
+                c.drawOval(new RectF(cx - 4f * k, cy - 9f * k, cx + 4f * k, cy + 9f * k), stroke);
+                c.drawLine(cx - 9f * k, cy, cx + 9f * k, cy, stroke);
+                break;
+            }
+            default: {          // 齿轮：圆 + 中心圆 + 四根齿
+                c.drawCircle(cx, cy, 6.5f * k, stroke);
+                c.drawCircle(cx, cy, 2.4f * k, fill);
+                for (int i = 0; i < 4; i++) {
+                    double a = Math.PI / 4 + i * Math.PI / 2;
+                    float x1 = (float) (cx + Math.cos(a) * 7.5f * k);
+                    float y1 = (float) (cy + Math.sin(a) * 7.5f * k);
+                    float x2 = (float) (cx + Math.cos(a) * 11f * k);
+                    float y2 = (float) (cy + Math.sin(a) * 11f * k);
+                    c.drawLine(x1, y1, x2, y2, stroke);
+                }
+                break;
+            }
+        }
+        stroke.setStrokeCap(Paint.Cap.BUTT);
     }
 
     private int cellIndex(RectF box) {
@@ -566,6 +621,7 @@ public class VoicePadView extends View {
                 if (p == 5) { if (cb != null) cb.onUndoLast(); return true; }
                 if (p == 8) { if (cb != null) cb.onOpenSettings(); return true; }
                 if (p == 6) { if (cb != null) cb.onPasteClipboard(); return true; }
+                if (p == 7) { if (cb != null) cb.onToggleLanguage(); return true; }
                 if (p == 4) {
                     long now = System.currentTimeMillis();
                     if (now - lastTap < 400) {
