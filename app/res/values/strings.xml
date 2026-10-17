@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">序言输入法</string>
+    <string name="ime_name">序言输入法</string>
+    <string name="subtype_label">序言</string>
+</resources>

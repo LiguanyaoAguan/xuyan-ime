@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 输入法窗口：悬浮 + 透明底，实际视觉由 VoicePadView 自绘 -->
+    <style name="ImeTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowIsFloating">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:colorBackgroundCacheHint">@null</item>
+    </style>
+
+    <!-- 设置页：普通深色 -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF15171C</item>
+        <item name="android:statusBarColor">#FF15171C</item>
+        <item name="android:navigationBarColor">#FF15171C</item>
+    </style>
+</resources>

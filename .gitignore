@@ -1,0 +1,28 @@
+# 构建产物
+dist/
+*.apk
+*.apk.idsig
+
+# 原生库（31MB，来自 sherpa-onnx AAR，见 README 获取方式）
+jni/*.so
+
+# 构建依赖（体积大 / 含密钥，自行准备，见 README）
+tools/android.jar
+tools/debug.keystore
+*.keystore
+*.jks
+
+# 模型（体积大，自行下载，见 README）
+*.onnx
+*.bin
+models/
+models-stream/
+
+# IDE / 系统
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
