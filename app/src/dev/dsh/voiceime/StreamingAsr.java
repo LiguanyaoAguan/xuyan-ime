@@ -201,6 +201,20 @@ public class StreamingAsr {
         }
     }
 
+    /** 取消本次流式识别：丢弃队列和草稿，不执行收尾解码。 */
+    public void cancel() {
+        running = false;
+        synchronized (queue) { queue.clear(); }
+        Thread w = worker;
+        if (w != null) {
+            w.interrupt();
+            try { w.join(500); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        }
+        worker = null;
+        releaseStream();
+        latest = "";
+    }
+
     /** 结束：把剩余音频解完，返回最终草稿 */
     public String finish() {
         running = false;

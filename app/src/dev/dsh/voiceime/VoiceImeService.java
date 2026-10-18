@@ -2,6 +2,8 @@ package dev.dsh.voiceime;
 
 import android.Manifest;
 import android.content.BroadcastReceiver;
+import android.content.ClipboardManager;
+import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -48,6 +50,33 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     private BroadcastReceiver commitRx;
     private boolean busy;
     private int lastCommitLen;
+    private boolean numericKeyboardMode;
+    private android.widget.PopupWindow numericKeyboardPopup;
+    private FloatingQwertyView qwertyView;
+    // 键盘展开时使用的独立胶囊实例。绝不把主胶囊 pad 挪进别的父容器：
+    // 同一个 View 同时被 WindowManager 和键盘容器持有会直接抛
+    // "The specified child already has a parent"，展开就此中断且不回滚。
+    private VoicePadView padExpanded;
+    private android.view.WindowManager qwertyWm;
+    private android.view.WindowManager.LayoutParams qwertyLp;
+    private boolean qwertyDragging;
+    private View qwertyRoot;
+    private float qwertyDownRawX, qwertyDownRawY;
+    private int qwertyDragStartX, qwertyDragStartY;
+    private static final String K_QWERTY_X = "qwerty_x";
+    private static final String K_QWERTY_Y = "qwerty_y";
+    private InputConnection keyboardTargetConnection;
+    private String keyboardTargetPackage;
+
+    // 剪贴板历史仅保存在本次服务进程内存中，最多 10 条，不落盘、不写日志。
+    private final java.util.ArrayList<String> clipboardHistory = new java.util.ArrayList<>();
+    private android.view.WindowManager historyWm;
+    private View historyView;
+    private android.view.WindowManager.LayoutParams historyLp;
+    private android.widget.LinearLayout historyList;
+    private boolean historyAttached;
+    private InputConnection historyTargetConnection;
+    private String historyTargetPackage;
     private String recTargetPkg;
     private volatile boolean streamingOn;   // 本次录音是否启用了流式草稿
     private volatile String draftTarget = "";   // 模型最新给的草稿全文
@@ -55,6 +84,10 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     private int draftWritten;                   // 本次草稿总共写进输入框的字符数
     private boolean tickerOn;      // 录音开始时锁定的目标 App，防止中途切走还往原处写
     private long recStart;
+    // 每次录音/识别使用代次令牌；焦点变更或取消后，旧后台结果不得再上屏。
+    private volatile long captureGeneration;
+    private InputConnection recTargetConnection;
+    private String recTargetEditorKey;
 
     // ---------------------------------------------------------------- 生命周期
 
@@ -71,6 +104,17 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     @Override
     public View onCreateInputView() {
         setupCapsule();
+        if(qwertyRoot!=null){applyStubWindow();return makeStub();}
+        if (inlineKeyboardView instanceof FloatingQwertyView) {
+            setInputView(inlineKeyboardView);
+            applyNumericWindowLayout();
+            return inlineKeyboardView;
+        }
+        if (inlineKeyboardView != null) {
+            setInputView(inlineKeyboardView);
+            applyNumericWindowLayout();
+            return inlineKeyboardView;
+        }
         if (overlayMode && attachOverlay()) {
             applyStubWindow();          // 必须！否则输入法窗口仍是全屏，把 App 压成白屏
             return makeStub();
@@ -83,11 +127,26 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     @Override
     public void onStartInputView(EditorInfo info, boolean restarting) {
         super.onStartInputView(info, restarting);
+        cancelCaptureIfTargetChanged("onStartInputView");
         AsrEngine.get(this).warmUp();          // 双保险
         if (!AsrSettings.isCloud(this)) StreamingAsr.get(this).warmUp();
 
+        // 浮动 QWERTY 自身承载胶囊与键区，保持独立输入法窗口透明占位。
+        if(qwertyRoot!=null){applyStubWindow();refreshStatus();return;}
         // 关键：onCreateInputView 通常只会被调用一次，而 onFinishInputView 里我们
         // 把悬浮窗卸下来了。所以每次显示键盘都要在这里重新判断 + 重新挂上。
+        if (inlineKeyboardView instanceof FloatingQwertyView) {
+            setInputView(inlineKeyboardView);
+            applyNumericWindowLayout();
+            refreshStatus();
+            return;
+        }
+        if (inlineKeyboardView != null) {
+            setInputView(inlineKeyboardView);
+            applyNumericWindowLayout();
+            refreshStatus();
+            return;
+        }
         setupCapsule();
         if (overlayMode) {
             if (!attachOverlay()) {
@@ -116,6 +175,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     private android.view.WindowManager.LayoutParams capsuleLp;
     private boolean overlayMode;      // 是否用悬浮窗模式
     private boolean overlayAttached;  // 当前是否已挂在 WindowManager 上
+    private View inlineKeyboardView;
     private boolean panelOpen;        // L2 面板是否展开
     private int capX, capY;           // 展开前胶囊的位置（收起时还原）
 
@@ -123,6 +183,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     private void setupCapsule() {
         if (pad != null) return;
         pad = new VoicePadView(this);
+        pad.setWindowPos(getSharedPreferences(PREFS,MODE_PRIVATE).getInt(K_WIN_X,-1),getSharedPreferences(PREFS,MODE_PRIVATE).getInt(K_WIN_Y,-1));
         pad.setCallback(this);
         overlayMode = canOverlay();
         Log.i(TAG, "胶囊视图已创建，悬浮窗权限=" + overlayMode);
@@ -134,6 +195,27 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
         } catch (Throwable e) {
             return false;
         }
+    }
+
+    // ------------------------------------------------------------ 胶囊状态转发
+    // 录音/识别状态必须同时落到"当前可见的那个胶囊"上：常态是 pad，
+    // 键盘展开时 pad 已移出屏幕，只有 padExpanded 可见。
+
+    private VoicePadView activePad() { return padExpanded != null ? padExpanded : pad; }
+
+    private void setPadState(int state) {
+        VoicePadView a = activePad();
+        if (a != null) a.setState(state);
+    }
+
+    private void setPadLevel(float level) {
+        VoicePadView a = activePad();
+        if (a != null) a.setLevel(level);
+    }
+
+    private int activePadState() {
+        VoicePadView a = activePad();
+        return a == null ? VoicePadView.S_IDLE : a.getState();
     }
 
     /**
@@ -201,6 +283,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
             capsuleLp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
         }
         int[] pos = savedPos(w, h);
+        if(pad.getParent()!=null){try{((android.view.ViewGroup)pad.getParent()).removeView(pad);}catch(Throwable ignored){}}
         capsuleLp.x = pos[0];
         capsuleLp.y = pos[1];
         try {
@@ -218,7 +301,19 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
 
     /** 只卸下悬浮窗，不销毁视图对象，方便下次重新挂 */
     private void detachOverlay() {
-        if (!overlayAttached || pad == null || wm == null) return;
+        // 输入法整体收起时不能走 hideQwertyKeyboard()：那个方法会把胶囊重新挂回屏幕。
+        if (qwertyRoot != null && qwertyWm != null) {
+            try { qwertyWm.removeViewImmediate(qwertyRoot); } catch (Throwable ignored) { }
+        }
+        qwertyRoot = null; qwertyWm = null; qwertyLp = null;
+        qwertyView = null; padExpanded = null; qwertyDragging = false;
+        if (inlineKeyboardView instanceof FloatingQwertyView) {
+            inlineKeyboardView = null;
+            try { setInputView(makeStub()); } catch (Throwable ignored) { }
+        }
+        hideNumericKeyboard();
+        dismissClipboardHistory();
+        if (!overlayAttached || pad == null || wm == null) { overlayAttached = false; return; }
         try {
             wm.removeViewImmediate(pad);
             Log.i(TAG, "胶囊悬浮窗已卸下");
@@ -245,7 +340,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     }
 
     private void placeCapsule() {
-        if (pad == null || panelOpen) return;
+        if (pad == null) return;
         float density = getResources().getDisplayMetrics().density;
         int w = (int) (VoicePadView.W * density);
         int h = (int) (VoicePadView.H * density);
@@ -261,6 +356,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
             try {
                 wm.updateViewLayout(pad, capsuleLp);
                 pad.setWindowPos(nx, ny);
+                getSharedPreferences(PREFS,MODE_PRIVATE).edit().putInt(K_WIN_X,nx).putInt(K_WIN_Y,ny).apply();
             } catch (Throwable e) {
                 Log.e(TAG, "移动悬浮窗失败", e);
             }
@@ -273,8 +369,25 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
             lp.y = ny;
             win.setAttributes(lp);
             pad.setWindowPos(nx, ny);
+            getSharedPreferences(PREFS,MODE_PRIVATE).edit().putInt(K_WIN_X,nx).putInt(K_WIN_Y,ny).apply();
         } catch (Throwable e) {
             Log.e(TAG, "移动输入法窗口失败", e);
+        }
+    }
+
+    private void applyNumericWindowLayout() {
+        if (inlineKeyboardView == null) return;
+        try {
+            android.view.Window win = getWindow().getWindow();
+            android.view.WindowManager.LayoutParams lp = win.getAttributes();
+            lp.width = android.view.WindowManager.LayoutParams.MATCH_PARENT;
+            lp.height = android.view.WindowManager.LayoutParams.WRAP_CONTENT;
+            lp.gravity = android.view.Gravity.BOTTOM | android.view.Gravity.START;
+            lp.x = 0;
+            lp.y = 0;
+            win.setAttributes(lp);
+        } catch (Throwable e) {
+            Log.e(TAG, "设置数字键盘窗口失败", e);
         }
     }
 
@@ -322,136 +435,622 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
                 .putInt(K_WIN_X, x).putInt(K_WIN_Y, y).apply();
     }
 
-    /** 长按空白处 / 面板右上角 ⌄：在胶囊与 L2 面板之间切换 */
+    /** 长按剪贴板：显示本机内存历史（不是系统全局剪贴板历史）。 */
     @Override
-    public void onExpandPanel() {
-        togglePanel();
+    public void onToggleKeyboard() {
+        if (qwertyView != null || inlineKeyboardView instanceof FloatingQwertyView) hideQwertyKeyboard();
+        else showQwertyKeyboard();
     }
 
-    private void togglePanel() {
-        if (pad == null) return;
-        float d = getResources().getDisplayMetrics().density;
-        int cw = (int) (VoicePadView.W * d), ch = (int) (VoicePadView.H * d);
-        int pw = (int) (VoicePadView.PW * d), ph = (int) (VoicePadView.PH * d);
-        int screenW = getResources().getDisplayMetrics().widthPixels;
-        int screenH = getResources().getDisplayMetrics().heightPixels;
+    private void showQwertyKeyboard() {
+        if (qwertyRoot != null || inlineKeyboardView instanceof FloatingQwertyView) return;   // 已经展开
+        hideNumericKeyboard();
+        keyboardTargetConnection = getCurrentInputConnection();
+        EditorInfo editor = getCurrentInputEditorInfo();
+        keyboardTargetPackage = editor == null ? null : editor.packageName;
+        if (keyboardTargetConnection == null) { toast("当前没有输入框"); return; }
+        final SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        boolean hadCapsulePosition = capsuleLp != null || sp.contains(K_WIN_X);
+        int capsuleX = capsuleLp == null ? sp.getInt(K_WIN_X, -1) : capsuleLp.x;
+        int capsuleY = capsuleLp == null ? sp.getInt(K_WIN_Y, -1) : capsuleLp.y;
+        if (wm == null) wm = (android.view.WindowManager) getSystemService(WINDOW_SERVICE);
+        boolean useFloating = canOverlay() && wm != null;
 
-        if (!overlayAttached || capsuleLp == null || wm == null) {
-            toast("面板需要悬浮窗权限");
+        final android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        final int width = Math.min(dp(540), Math.max(dp(300), dm.widthPixels - dp(24)));
+        final int height = Math.min(dp((int) VoicePadView.EXPANDED_H),
+                Math.max(dp((int) VoicePadView.H + 40), dm.heightPixels - dp(36)));
+
+        // 展开态的胶囊是**另一个实例**。主胶囊 pad 始终只属于胶囊窗口，
+        // 不搬进键盘布局 —— 同一个 View 被两个父容器持有会抛
+        // IllegalStateException，之前的"半展开死状态"就是这么来的。
+        padExpanded = new VoicePadView(this);
+        padExpanded.setExpandedKeyboard(true);
+        padExpanded.setCallback(this);
+        padExpanded.setWindowPos(0, 0);
+        FloatingQwertyView view = new FloatingQwertyView(this, padExpanded);
+        view.setActions(new FloatingQwertyView.Actions() {
+            @Override public void onKey(String key) { commitQwertyKey(key); }
+            @Override public void onVoice() { hideQwertyKeyboard(); }
+        });
+        view.setOnDragHandle(new FloatingQwertyView.DragHandle() {
+            @Override public void onDown(float rawX, float rawY) {
+                qwertyDragging = false;
+                qwertyDownRawX = rawX; qwertyDownRawY = rawY;
+                qwertyDragStartX = qwertyLp == null ? dp(12) : qwertyLp.x;
+                qwertyDragStartY = qwertyLp == null ? dm.heightPixels - height - dp(18) : qwertyLp.y;
+            }
+            @Override public void onMove(float rawX, float rawY) {
+                if (Math.abs(rawX - qwertyDownRawX) + Math.abs(rawY - qwertyDownRawY) > dp(5)) qwertyDragging = true;
+                if (!qwertyDragging || qwertyLp == null || qwertyWm == null || qwertyRoot == null) return;
+                qwertyLp.x = clamp(qwertyDragStartX + (int) (rawX - qwertyDownRawX), 0, Math.max(0, dm.widthPixels - width));
+                qwertyLp.y = clamp(qwertyDragStartY + (int) (rawY - qwertyDownRawY), dp(24), Math.max(dp(24), dm.heightPixels - height - dp(12)));
+                try { qwertyWm.updateViewLayout(qwertyRoot, qwertyLp); } catch (Throwable ignored) { }
+            }
+            @Override public void onUp() {
+                if (qwertyLp != null) {
+                    sp.edit().putInt(K_QWERTY_X, qwertyLp.x).putInt(K_QWERTY_Y, qwertyLp.y).apply();
+                }
+            }
+        });
+
+        if (!useFloating) {
+            if (overlayAttached && wm != null) {
+                try { wm.removeViewImmediate(pad); } catch (Throwable ignored) { }
+                overlayAttached = false;
+            }
+            if (pad.getParent() != null) {
+                try { ((android.view.ViewGroup) pad.getParent()).removeView(pad); } catch (Throwable ignored) { }
+            }
+            qwertyView = view;
+            inlineKeyboardView = view;
+            try {
+                setInputView(view);
+                applyNumericWindowLayout();
+                Log.i(TAG, "QWERTY 已展开为输入法内嵌视图");
+            } catch (Throwable e) {
+                Log.e(TAG, "内嵌键盘展开失败", e);
+                abortQwertyKeyboard();
+            }
             return;
         }
 
-        if (!panelOpen) {
-            capX = capsuleLp.x;
-            capY = capsuleLp.y;
-            int nx = clamp(capX + cw / 2 - pw / 2, 0, screenW - pw);
-            // 胶囊在下半屏 → 面板向上长；在上半屏 → 向下长
-            int ny = (capY + ch > screenH / 2) ? (capY + ch - ph) : capY;
-            ny = clamp(ny, 0, screenH - ph);
-            capsuleLp.width = pw;
-            capsuleLp.height = ph;
-            capsuleLp.x = nx;
-            capsuleLp.y = ny;
-            try {
-                wm.updateViewLayout(pad, capsuleLp);
-                pad.setWindowPos(nx, ny);
-                panelOpen = true;
-            } catch (Throwable e) {
-                Log.e(TAG, "展开面板失败", e);
+        int x = sp.getInt(K_QWERTY_X, Math.max(dp(12), (dm.widthPixels - width) / 2));
+        int y = sp.getInt(K_QWERTY_Y, Math.max(dp(24), dm.heightPixels - height - dp(18)));
+        x = clamp(x, 0, Math.max(0, dm.widthPixels - width));
+        y = clamp(y, dp(24), Math.max(dp(24), dm.heightPixels - height - dp(12)));
+        if (hadCapsulePosition && capsuleX >= 0 && capsuleY >= 0) {
+            // 让展开后面板顶部的胶囊停在原胶囊位置附近
+            x = clamp(capsuleX, 0, Math.max(0, dm.widthPixels - width));
+            y = clamp(capsuleY - height + dp((int) VoicePadView.H),
+                    dp(24), Math.max(dp(24), dm.heightPixels - height - dp(12)));
+        }
+        qwertyRoot = view;
+        qwertyRoot.setLayoutParams(new android.view.ViewGroup.LayoutParams(width, height));
+        qwertyWm = wm;
+        qwertyLp = new android.view.WindowManager.LayoutParams(width, height, OVERLAY_TYPE,
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                android.graphics.PixelFormat.TRANSLUCENT);
+        qwertyLp.gravity = android.view.Gravity.TOP | android.view.Gravity.LEFT;
+        qwertyLp.x = x; qwertyLp.y = y;
+        try {
+            if (overlayAttached) { wm.removeViewImmediate(pad); overlayAttached = false; }
+            // 兼容"没有悬浮权限时胶囊曾作为输入视图"的情况：先确保原胶囊离开屏幕，
+            // 否则会出现「胶囊 + 键盘」两个面板叠在一起。
+            if (pad.getParent() != null) {
+                try { ((android.view.ViewGroup) pad.getParent()).removeView(pad); } catch (Throwable ignored) { }
             }
-        } else {
-            capsuleLp.width = cw;
-            capsuleLp.height = ch;
-            capsuleLp.x = clamp(capX, 0, screenW - cw);
-            capsuleLp.y = clamp(capY, 0, screenH - ch);
+            qwertyWm.addView(qwertyRoot, qwertyLp);
+            qwertyView = view;
+            pad.setWindowPos(x, y);
+            applyStubWindow();
+            Log.i(TAG, "QWERTY 浮窗已展开 @" + x + "," + y + " " + width + "x" + height);
+        } catch (Throwable e) {
+            Log.e(TAG, "QWERTY 浮窗展开失败，回滚到胶囊", e);
+            abortQwertyKeyboard();
+        }
+    }
+
+    /** 展开失败时的统一回滚：不留"键盘已隐藏、胶囊又没回来"的死状态。 */
+    private void abortQwertyKeyboard() {
+        if (qwertyRoot != null && qwertyWm != null) {
+            try { qwertyWm.removeViewImmediate(qwertyRoot); } catch (Throwable ignored) { }
+        }
+        qwertyRoot = null; qwertyWm = null; qwertyLp = null;
+        qwertyView = null; padExpanded = null; qwertyDragging = false;
+        inlineKeyboardView = null;
+        keyboardTargetConnection = null; keyboardTargetPackage = null;
+        if (pad != null) pad.setExpandedKeyboard(false);
+        try {
+            overlayMode = canOverlay();
+            if (overlayMode && attachOverlay()) {
+                applyStubWindow();
+                setInputView(makeStub());
+            } else {
+                overlayMode = false;
+                setInputView(pad);
+                applyWindowLayout();
+            }
+        } catch (Throwable e) {
+            Log.e(TAG, "回滚胶囊失败", e);
+        }
+        toast("键盘展开失败，已恢复胶囊");
+    }
+
+    private void commitQwertyKey(String key) {
+        InputConnection current = getCurrentInputConnection();
+        EditorInfo editor = getCurrentInputEditorInfo();
+        String pkg = editor == null ? null : editor.packageName;
+        if (current == null || current != keyboardTargetConnection || !java.util.Objects.equals(pkg, keyboardTargetPackage)) {
+            toast("输入目标已变化，未输入"); hideQwertyKeyboard(); return;
+        }
+        try {
+            if ("⌫".equals(key)) {
+                CharSequence selected = current.getSelectedText(0);
+                if (selected != null && selected.length() > 0) current.commitText("", 1);
+                else current.deleteSurroundingText(1, 0);
+            } else if ("↵".equals(key)) {
+                if (current == getCurrentInputConnection()) onEnter();
+            }
+            else if ("空格".equals(key)) current.commitText(" ", 1);
+            else current.commitText(key, 1);
+        } catch (Throwable e) { toast("按键输入失败"); }
+    }
+
+    private void hideQwertyKeyboard() {
+        boolean wasInline = inlineKeyboardView instanceof FloatingQwertyView;
+        final SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        int restoreX = qwertyLp == null
+                ? (capsuleLp == null ? sp.getInt(K_WIN_X, dp(12)) : capsuleLp.x) : qwertyLp.x;
+        int restoreY = qwertyLp == null
+                ? (capsuleLp == null ? sp.getInt(K_WIN_Y, dp(120)) : capsuleLp.y)
+                : qwertyLp.y + dp((int) (VoicePadView.EXPANDED_H - VoicePadView.H));
+        if (qwertyRoot != null && qwertyWm != null) {
+            try { qwertyWm.removeViewImmediate(qwertyRoot); } catch (Throwable ignored) { }
+        }
+        qwertyRoot = null; qwertyWm = null; qwertyLp = null; qwertyDragging = false;
+        qwertyView = null; padExpanded = null;
+        keyboardTargetConnection = null; keyboardTargetPackage = null;
+        if (pad == null) setupCapsule();
+        if (pad == null) return;
+        pad.setExpandedKeyboard(false);
+        pad.setWindowPos(restoreX, restoreY);
+        sp.edit().putInt(K_WIN_X, restoreX).putInt(K_WIN_Y, restoreY).apply();
+        if (wasInline) {
+            inlineKeyboardView = null;
+            overlayMode = canOverlay();
             try {
-                wm.updateViewLayout(pad, capsuleLp);
-                pad.setWindowPos(capsuleLp.x, capsuleLp.y);
-                panelOpen = false;
+                if (overlayMode && attachOverlay()) {
+                    if (capsuleLp != null) { capsuleLp.x = restoreX; capsuleLp.y = restoreY; }
+                    applyStubWindow();
+                    setInputView(makeStub());
+                } else {
+                    overlayMode = false;
+                    setInputView(pad);
+                    applyWindowLayout();
+                }
             } catch (Throwable e) {
-                Log.e(TAG, "收起面板失败", e);
+                Log.e(TAG, "收起键盘后恢复胶囊失败", e);
+            }
+        } else if (overlayMode && canOverlay()) {
+            if (attachOverlay()) {
+                if (capsuleLp != null) {
+                    capsuleLp.x = restoreX; capsuleLp.y = restoreY;
+                    try { wm.updateViewLayout(pad, capsuleLp); } catch (Throwable ignored) { }
+                }
+                applyStubWindow();
             }
         }
     }
 
-    /** 面板里的「撤销」：撤掉上一次语音上屏的那一段 */
-    @Override
-    public void onUndoLast() {
-        InputConnection ic = getCurrentInputConnection();
-        if (ic == null) return;
-        int n = lastCommitLen;
-        if (n <= 0) {
-            toast("没有可撤销的上屏内容");
+    private void showNumericKeyboard() {
+        hideNumericKeyboard();
+        keyboardTargetConnection = getCurrentInputConnection();
+        EditorInfo editor = getCurrentInputEditorInfo();
+        keyboardTargetPackage = editor == null ? null : editor.packageName;
+        if (keyboardTargetConnection == null) {
+            toast("当前没有输入框");
+            return;
+        }
+        numericKeyboardMode = true;
+        android.widget.LinearLayout root = buildNumericKeyboardView();
+        if (!overlayAttached || !canOverlay()) {
+            inlineKeyboardView = root;
+            try { setInputView(inlineKeyboardView); } catch (Throwable e) { toast("无法切换键盘"); }
+            return;
+        }
+        numericKeyboardPopup = new android.widget.PopupWindow(root, dp(264), dp(390), false);
+        numericKeyboardPopup.setTouchable(true);
+        numericKeyboardPopup.setOutsideTouchable(true);
+        numericKeyboardPopup.setBackgroundDrawable(roundRect(0xFF1D2530, dp(18), 0));
+        numericKeyboardPopup.setOnDismissListener(() -> {
+            numericKeyboardPopup = null;
+            numericKeyboardMode = false;
+            keyboardTargetConnection = null;
+            keyboardTargetPackage = null;
+        });
+        int x = clamp((int) (getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density / 2 - 132), 4, Math.max(4, (int) (getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density) - 268));
+        int y = clamp((int) (getResources().getDisplayMetrics().heightPixels / getResources().getDisplayMetrics().density - 410), 4, Integer.MAX_VALUE);
+        try {
+            numericKeyboardPopup.showAtLocation(pad, android.view.Gravity.TOP | android.view.Gravity.LEFT, dp(x), dp(y));
+        } catch (Throwable e) {
+            hideNumericKeyboard();
+            toast("无法打开数字键盘");
+        }
+    }
+
+    private android.widget.LinearLayout buildNumericKeyboardView() {
+        android.widget.LinearLayout root = new android.widget.LinearLayout(this);
+        root.setOrientation(android.widget.LinearLayout.VERTICAL);
+        root.setPadding(dp(12), dp(10), dp(12), dp(12));
+        root.setBackground(roundRect(0xFF1D2530, dp(18), 0x1AFFFFFF));
+
+        android.widget.LinearLayout top = new android.widget.LinearLayout(this);
+        top.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        android.widget.TextView title = historyText("数字键盘", 15, 0xFFF1F5F9, true);
+        top.addView(title, new android.widget.LinearLayout.LayoutParams(0, dp(36), 1));
+        android.widget.TextView voice = historyAction("语音");
+        voice.setTextSize(13);
+        voice.setOnClickListener(v -> hideNumericKeyboard());
+        top.addView(voice, new android.widget.LinearLayout.LayoutParams(dp(56), dp(40)));
+        root.addView(top);
+
+        android.widget.GridLayout grid = new android.widget.GridLayout(this);
+        grid.setColumnCount(3);
+        String[] keys = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "@", "0", "⌫", ".", "-", "_", "+", ":", "/", "空格", "↵"};
+        for (String key : keys) {
+            android.widget.TextView button = historyAction(key);
+            button.setTextSize(key.length() > 1 ? 15 : 20);
+            button.setTextColor(0xFFE2E8F0);
+            button.setBackground(roundRect(0xFF252F3D, dp(12), 0));
+            button.setContentDescription("键 " + key);
+            button.setOnClickListener(v -> commitKeyboardKey(key));
+            android.widget.GridLayout.LayoutParams glp = new android.widget.GridLayout.LayoutParams();
+            glp.width = 0;
+            glp.height = dp(48);
+            glp.columnSpec = android.widget.GridLayout.spec(android.widget.GridLayout.UNDEFINED, 1f);
+            glp.setMargins(dp(3), dp(3), dp(3), dp(3));
+            grid.addView(button, glp);
+        }
+        root.addView(grid);
+
+        return root;
+    }
+
+    private void commitKeyboardKey(String key) {
+        InputConnection current = getCurrentInputConnection();
+        EditorInfo editor = getCurrentInputEditorInfo();
+        String pkg = editor == null ? null : editor.packageName;
+        if (keyboardTargetConnection == null || current == null || current != keyboardTargetConnection
+                || !java.util.Objects.equals(pkg, keyboardTargetPackage)) {
+            toast("输入目标已变化，未输入");
+            hideNumericKeyboard();
             return;
         }
         try {
-            ic.finishComposingText();
-            ic.deleteSurroundingText(n, 0);
-            lastCommitLen = 0;
+            if ("⌫".equals(key)) {
+                CharSequence selected = current.getSelectedText(0);
+                if (selected != null && selected.length() > 0) current.commitText("", 1);
+                else current.deleteSurroundingText(1, 0);
+            } else if ("↵".equals(key)) {
+                onEnter();
+            } else if ("空格".equals(key)) {
+                current.commitText(" ", 1);
+                lastCommitLen = 1;
+            } else {
+                current.commitText(key, 1);
+                lastCommitLen = key.length();
+            }
         } catch (Throwable e) {
-            Log.e(TAG, "撤销上屏失败", e);
+            toast("输入失败");
         }
     }
 
-    /**
-     * 面板里的「语言」：在 auto → zh → en → ja → ko → yue 之间循环。
-     * 立即生效（重建识别器约 1 秒）；非中文时自动关掉流式草稿，
-     * 因为流式模型只有中文，硬跑只会出乱码。
-     */
+    private void hideNumericKeyboard() {
+        if (inlineKeyboardView != null) {
+            View oldInline = inlineKeyboardView;
+            inlineKeyboardView = null;
+            numericKeyboardMode = false;
+            keyboardTargetConnection = null;
+            keyboardTargetPackage = null;
+            setupCapsule();
+            if (oldInline.getParent() != null) ((android.view.ViewGroup) oldInline.getParent()).removeView(oldInline);
+            overlayMode = canOverlay();
+            if (overlayMode && attachOverlay()) {
+                applyStubWindow();
+                placeCapsule();
+                try { setInputView(makeStub()); } catch (Throwable ignored) { }
+            } else {
+                overlayMode = false;
+                try { setInputView(pad); applyWindowLayout(); } catch (Throwable ignored) { }
+            }
+        } else if (numericKeyboardPopup != null) {
+            // 浮层模式关闭时保留当前输入法视图及输入焦点。
+        }
+        android.widget.PopupWindow popup = numericKeyboardPopup;
+        numericKeyboardPopup = null;
+        if (popup != null) {
+            try { if (popup.isShowing()) popup.dismiss(); } catch (Throwable ignored) { }
+        }
+        numericKeyboardMode = false;
+        keyboardTargetConnection = null;
+        keyboardTargetPackage = null;
+    }
+
     @Override
-    public void onToggleLanguage() {
-        AsrEngine e = AsrEngine.get(this);
-        String[] langs = AsrEngine.LANGS;
-        int idx = 0;
-        for (int i = 0; i < langs.length; i++) if (langs[i].equals(e.language())) idx = i;
-        String next = langs[(idx + 1) % langs.length];
-        e.setLanguage(next);
-
-        String name;
-        switch (next) {
-            case "auto": name = "自动判断"; break;
-            case "zh": name = "中文"; break;
-            case "en": name = "English"; break;
-            case "ja": name = "日本語"; break;
-            case "ko": name = "한국어"; break;
-            default: name = "粵語"; break;
+    public void onClipboardHistory() {
+        if (!captureClipboardText(false)) {
+            // 继续显示已采集历史；无历史时由浮层显示空态。
         }
-        toast("识别语言：" + name + (("zh".equals(next) || "auto".equals(next)) ? "" : "（草稿已暂停）"));
+        showClipboardHistory();
     }
 
-    /** 面板里的「剪贴板」：把剪贴板内容直接粘到输入框 */
+    /** 单击：将当前剪贴板纯文本插入录音时对应的当前输入框。 */
     @Override
     public void onPasteClipboard() {
+        String text = readClipboardText();
+        if (text == null) {
+            toast("剪贴板没有可粘贴的文本");
+            return;
+        }
+        addClipboardHistory(text);
+        InputConnection ic = getCurrentInputConnection();
+        if (ic == null) {
+            toast("当前没有输入框");
+            return;
+        }
         try {
-            android.content.ClipboardManager cm = (android.content.ClipboardManager)
-                    getSystemService(CLIPBOARD_SERVICE);
-            if (cm == null || !cm.hasPrimaryClip() || cm.getPrimaryClip() == null
-                    || cm.getPrimaryClip().getItemCount() == 0) {
-                toast("剪贴板是空的");
-                return;
-            }
-            CharSequence t = cm.getPrimaryClip().getItemAt(0).coerceToText(this);
-            if (t == null || t.length() == 0) {
-                toast("剪贴板是空的");
-                return;
-            }
-            InputConnection ic = getCurrentInputConnection();
-            if (ic == null) {
-                toast("当前没有输入框");
-                return;
-            }
-            String text = t.toString();
             ic.commitText(text, 1);
             lastCommitLen = text.length();
             toast("已粘贴 " + text.length() + " 字");
         } catch (Throwable e) {
-            Log.e(TAG, "粘贴失败", e);
-            toast("粘贴失败：" + e.getMessage());
+            Log.w(TAG, "粘贴失败");
+            toast("粘贴失败");
         }
     }
 
+    private String readClipboardText() {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip()) return null;
+            ClipData clip = cm.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) return null;
+            CharSequence text = clip.getItemAt(0).getText();
+            if (text == null || text.length() == 0) return null;
+            return text.toString();
+        } catch (Throwable e) {
+            Log.w(TAG, "读取剪贴板文本失败");
+            return null;
+        }
+    }
+
+    /** 读取当前纯文本，去除首尾空内容；不会把 URI / Intent 强行转换成文本。 */
+    private boolean captureClipboardText(boolean notify) {
+        String text = readClipboardText();
+        if (text == null) {
+            if (notify) toast("剪贴板没有可保存的文本");
+            return false;
+        }
+        addClipboardHistory(text);
+        return true;
+    }
+
+    private void addClipboardHistory(String text) {
+        if (text == null || text.trim().isEmpty()) return;
+        clipboardHistory.remove(text);
+        clipboardHistory.add(0, text);
+        while (clipboardHistory.size() > 10) clipboardHistory.remove(clipboardHistory.size() - 1);
+    }
+
+    private void showClipboardHistory() {
+        if (historyView != null) {
+            renderClipboardHistory();
+            return;
+        }
+        if (!overlayAttached || !canOverlay()) {
+            toast("请先开启悬浮窗权限");
+            return;
+        }
+        historyTargetConnection = getCurrentInputConnection();
+        EditorInfo editor = getCurrentInputEditorInfo();
+        historyTargetPackage = editor == null ? null : editor.packageName;
+        if (historyTargetConnection == null) {
+            toast("当前没有输入框");
+            return;
+        }
+        historyWm = (android.view.WindowManager) getSystemService(WINDOW_SERVICE);
+        if (historyWm == null) {
+            toast("无法打开剪贴板历史");
+            return;
+        }
+
+        android.widget.LinearLayout root = new android.widget.LinearLayout(this);
+        root.setOrientation(android.widget.LinearLayout.VERTICAL);
+        root.setPadding(dp(14), dp(12), dp(14), dp(10));
+        root.setBackground(roundRect(0xFF1D2530, dp(18), 0x1AFFFFFF));
+        root.setElevation(0f);
+        historyView = root;
+
+        android.widget.LinearLayout header = new android.widget.LinearLayout(this);
+        header.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        android.widget.TextView title = historyText("剪贴板历史", 16, 0xFFF1F5F9, true);
+        header.addView(title, new android.widget.LinearLayout.LayoutParams(0, dp(42), 1));
+        android.widget.TextView clear = historyAction("清空");
+        clear.setOnClickListener(v -> {
+            clipboardHistory.clear();
+            renderClipboardHistory();
+        });
+        header.addView(clear, new android.widget.LinearLayout.LayoutParams(dp(48), dp(42)));
+        android.widget.TextView close = historyAction("×");
+        close.setTextSize(24);
+        close.setOnClickListener(v -> dismissClipboardHistory());
+        header.addView(close, new android.widget.LinearLayout.LayoutParams(dp(36), dp(42)));
+        root.addView(header);
+
+        android.widget.ScrollView scroll = new android.widget.ScrollView(this);
+        scroll.setFillViewport(true);
+        android.widget.LinearLayout list = new android.widget.LinearLayout(this);
+        list.setOrientation(android.widget.LinearLayout.VERTICAL);
+        historyList = list;
+        scroll.addView(list, new android.widget.ScrollView.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+        root.addView(scroll, new android.widget.LinearLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+
+        android.widget.TextView privacy = historyText("仅显示本输入法实际读取过的文本；历史仅保存在内存中。", 11, 0xFF94A3B8, false);
+        privacy.setPadding(dp(2), dp(8), dp(2), 0);
+        root.addView(privacy);
+
+        float density = getResources().getDisplayMetrics().density;
+        int screenW = getResources().getDisplayMetrics().widthPixels;
+        int screenH = getResources().getDisplayMetrics().heightPixels;
+        int width = Math.min(dp(336), screenW - dp(24));
+        int maxHeight = Math.min(dp(360), screenH - dp(48));
+        int capsuleW = (int) (VoicePadView.W * density);
+        int capsuleH = (int) (VoicePadView.H * density);
+        int left = overlayAttached && capsuleLp != null ? capsuleLp.x : 0;
+        int top = overlayAttached && capsuleLp != null ? capsuleLp.y : Math.max(0, screenH - capsuleH);
+        int x = clamp(left + capsuleW / 2 - width / 2, dp(12), screenW - width - dp(12));
+        int estimatedH = Math.min(maxHeight, dp(252));
+        int y;
+        if (top > screenH / 2 || top + capsuleH + estimatedH > screenH - dp(12)) {
+            y = Math.max(dp(12), top - estimatedH - dp(8));
+        } else {
+            y = Math.min(screenH - estimatedH - dp(12), top + capsuleH + dp(8));
+        }
+
+        historyLp = new android.view.WindowManager.LayoutParams(
+                width, maxHeight,
+                OVERLAY_TYPE,
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                android.graphics.PixelFormat.TRANSLUCENT);
+        historyLp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
+        historyLp.x = x;
+        historyLp.y = y;
+        try {
+            historyWm.addView(historyView, historyLp);
+            historyAttached = true;
+            renderClipboardHistory();
+        } catch (Throwable e) {
+            historyView = null;
+            historyLp = null;
+            historyAttached = false;
+            historyTargetConnection = null;
+            historyTargetPackage = null;
+            toast("无法打开剪贴板历史");
+        }
+    }
+
+    private void renderClipboardHistory() {
+        if (!(historyView instanceof android.widget.LinearLayout) || historyList == null) return;
+        android.widget.LinearLayout list = historyList;
+        list.removeAllViews();
+        if (clipboardHistory.isEmpty()) {
+            android.widget.TextView empty = historyText("还没有历史文本\n点按剪贴板键可粘贴并加入历史。", 13, 0xFF94A3B8, false);
+            empty.setGravity(android.view.Gravity.CENTER);
+            empty.setPadding(dp(10), dp(28), dp(10), dp(28));
+            list.addView(empty, new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+            return;
+        }
+        for (int i = 0; i < clipboardHistory.size(); i++) {
+            final String text = clipboardHistory.get(i);
+            android.widget.LinearLayout row = new android.widget.LinearLayout(this);
+            row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(10), dp(7), dp(4), dp(7));
+            row.setBackground(roundRect(0xFF252F3D, dp(12), 0x00000000));
+            android.widget.TextView preview = historyText(text, 13, 0xFFE2E8F0, false);
+            preview.setMaxLines(2);
+            preview.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            row.addView(preview, new android.widget.LinearLayout.LayoutParams(0, dp(58), 1));
+            android.widget.TextView delete = historyAction("×");
+            delete.setTextSize(21);
+            delete.setOnClickListener(v -> {
+                clipboardHistory.remove(text);
+                renderClipboardHistory();
+            });
+            row.addView(delete, new android.widget.LinearLayout.LayoutParams(dp(38), dp(48)));
+            row.setOnClickListener(v -> pasteHistoryItem(text));
+            android.widget.LinearLayout.LayoutParams rp = new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            rp.bottomMargin = dp(6);
+            list.addView(row, rp);
+        }
+    }
+
+    private void pasteHistoryItem(String text) {
+        InputConnection current = getCurrentInputConnection();
+        EditorInfo editor = getCurrentInputEditorInfo();
+        String currentPkg = editor == null ? null : editor.packageName;
+        if (historyTargetConnection == null || current == null
+                || current != historyTargetConnection
+                || current.getHandler() != historyTargetConnection.getHandler()
+                || !java.util.Objects.equals(currentPkg, historyTargetPackage)) {
+            toast("输入目标已变化，未粘贴");
+            dismissClipboardHistory();
+            return;
+        }
+        try {
+            current.commitText(text, 1);
+            lastCommitLen = text.length();
+            dismissClipboardHistory();
+            toast("已粘贴 " + text.length() + " 字");
+        } catch (Throwable e) {
+            toast("粘贴失败");
+            dismissClipboardHistory();
+        }
+    }
+
+    private void dismissClipboardHistory() {
+        hideQwertyKeyboard();
+        hideNumericKeyboard();
+        if (historyView != null && historyWm != null && historyAttached) {
+            try { historyWm.removeViewImmediate(historyView); } catch (Throwable ignored) { }
+        }
+        historyAttached = false;
+        historyView = null;
+        historyLp = null;
+        historyList = null;
+        historyTargetConnection = null;
+        historyTargetPackage = null;
+    }
+
+    private android.widget.TextView historyText(String text, int size, int color, boolean bold) {
+        android.widget.TextView view = new android.widget.TextView(this);
+        view.setText(text);
+        view.setTextSize(size);
+        view.setTextColor(color);
+        if (bold) view.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        view.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        return view;
+    }
+
+    private android.widget.TextView historyAction(String text) {
+        android.widget.TextView view = historyText(text, 12, 0xFF60A5FA, false);
+        view.setGravity(android.view.Gravity.CENTER);
+        view.setBackground(roundRect(0x00000000, dp(10), 0x00000000));
+        view.setOnClickListener(v -> { });
+        return view;
+    }
+
+    private int dp(int value) {
+        return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private android.graphics.drawable.Drawable roundRect(int color, float radius, int strokeColor) {
+        android.graphics.drawable.GradientDrawable d = new android.graphics.drawable.GradientDrawable();
+        d.setColor(color);
+        d.setCornerRadius(radius);
+        if (strokeColor != 0) d.setStroke(dp(1), strokeColor);
+        return d;
+    }
+
     /** 面板里的「设置」：打开本 App 的安装与自检页 */
-    @Override
     public void onOpenSettings() {
         openSettings();
         requestHideSelf(0);
@@ -459,14 +1058,27 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
 
     @Override
     public void onFinishInputView(boolean finishingInput) {
-        if (recorder != null && recorder.isRecording()) recorder.cancel();
+        cancelCapture("IME input view hidden");
         detachOverlay();                    // 只卸下，不销毁，下次还要挂回去
         super.onFinishInputView(finishingInput);
     }
 
     @Override
+    public void onStartInput(EditorInfo attribute, boolean restarting) {
+        super.onStartInput(attribute, restarting);
+        cancelCaptureIfTargetChanged("onStartInput");
+    }
+
+    @Override
+    public void onFinishInput() {
+        cancelCapture("IME input finished");
+        super.onFinishInput();
+    }
+
+    @Override
     public void onDestroy() {
         if (commitRx != null) try { unregisterReceiver(commitRx); } catch (Throwable ignored) { }
+        cancelCapture("IME service destroyed");
         if (recorder != null) recorder.cancel();
         detachOverlay();
         pad = null;
@@ -504,6 +1116,8 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
      */
     private final Runnable draftTick = new Runnable() {
         @Override public void run() {
+            if (!tickerOn) return;
+            cancelCaptureIfTargetChanged("draft ticker");
             if (!tickerOn) return;
             InputConnection ic = getCurrentInputConnection();
             String fromModel = StreamingAsr.get(VoiceImeService.this).latest();
@@ -567,7 +1181,8 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
         draftWritten = 0;
         draftTarget = "";
         if (n <= 0) return;
-        InputConnection ic = getCurrentInputConnection();
+        // 必须撤回录音开始时的连接，绝不能把撤回操作作用于新焦点。
+        InputConnection ic = recTargetConnection;
         if (ic == null) return;
         try {
             ic.setComposingText("", 1);
@@ -585,6 +1200,52 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
             ic.setComposingText("", 1);
             ic.finishComposingText();
         } catch (Throwable ignored) { }
+    }
+
+    /** 目标编辑器/连接变化时取消整次采集，包含录音、流式草稿和后台整段识别。 */
+    private void cancelCaptureIfTargetChanged(String source) {
+        if (recorder == null && !busy && !tickerOn) return;
+        InputConnection now = getCurrentInputConnection();
+        String nowPkg = currentPkg();
+        boolean connectionChanged = now != recTargetConnection;
+        String nowEditorKey = editorKey(getCurrentInputEditorInfo());
+        boolean editorChanged = !recTargetEditorKey.equals(nowEditorKey);
+        boolean packageChanged = recTargetPkg != null && !recTargetPkg.isEmpty()
+                && !nowPkg.isEmpty() && !nowPkg.equals(recTargetPkg);
+        if (connectionChanged || editorChanged || packageChanged) {
+            Log.w(TAG, "采集目标变化（" + source + "），取消本次录音/识别");
+            cancelCapture("input target changed");
+        }
+    }
+
+    /** 取消而非收尾：不触发最终识别、网络请求或上屏。 */
+    private void cancelCapture(String reason) {
+        boolean active = recorder != null || busy || tickerOn;
+        if (!active) return;
+        ++captureGeneration; // 让已运行的 ASR/润色回调失效
+        Recorder old = recorder;
+        recorder = null;
+        if (old != null) old.cancel();
+        if (streamingOn) {
+            try { StreamingAsr.get(this).cancel(); } catch (Throwable e) {
+                Log.w(TAG, "取消流式识别失败", e);
+            }
+        }
+        streamingOn = false;
+        // 只撤回录音开始时连接里的流式草稿，不触碰后来获得焦点的输入框。
+        rollbackDraft();
+        busy = false;
+        recTargetConnection = null;
+        recTargetPkg = null;
+        recTargetEditorKey = "";
+        if (pad != null) setPadState(VoicePadView.S_IDLE);
+        Log.i(TAG, "本次采集已取消：" + reason);
+    }
+
+    private static String editorKey(EditorInfo info) {
+        if (info == null) return "";
+        return String.valueOf(info.packageName) + "|" + info.fieldId + "|"
+                + String.valueOf(info.fieldName) + "|" + info.inputType + "|" + info.imeOptions;
     }
 
     private String currentPkg() {
@@ -655,7 +1316,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     private void startRecord() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
-            pad.setState(VoicePadView.S_ERR);
+            setPadState(VoicePadView.S_ERR);
             toast("请先授予录音权限");
             openSettings();
             return;
@@ -664,29 +1325,32 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
         if (!AsrSettings.isCloud(this)) {
             AsrEngine e = AsrEngine.get(this);
             if (!e.modelPresent()) {
-                pad.setState(VoicePadView.S_ERR);
+                setPadState(VoicePadView.S_ERR);
                 return;
             }
             e.warmUp();                               // 万一还没预热
         } else if (AsrSettings.apiKey(this).isEmpty()) {
-            pad.setState(VoicePadView.S_ERR);
+            setPadState(VoicePadView.S_ERR);
             toast("请先在 App 里填 API Key");
             return;
         }
 
         recorder = new Recorder();
+        ++captureGeneration;
+        recTargetConnection = getCurrentInputConnection();
+        recTargetEditorKey = editorKey(getCurrentInputEditorInfo());
         recStart = System.currentTimeMillis();
         recTargetPkg = currentPkg();
         Log.i(TAG, "开始录音，目标 App = " + recTargetPkg);
         boolean ok = recorder.start((lvl, ms) -> ui.post(() -> {
-            if (pad != null) pad.setLevel(lvl);
+            if (pad != null) setPadLevel(lvl);
         }));
         if (!ok) {
-            pad.setState(VoicePadView.S_ERR);
+            setPadState(VoicePadView.S_ERR);
             recorder = null;
             return;
         }
-        pad.setState(VoicePadView.S_REC);
+        setPadState(VoicePadView.S_REC);
 
         // ---- 流式草稿（边说边出字）----
         StreamingAsr st = StreamingAsr.get(this);
@@ -708,10 +1372,10 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     private void stopAndTranscribe() {
         float[] pcm = recorder.stop();
         recorder = null;
-        pad.setState(VoicePadView.S_IDLE);
+        setPadState(VoicePadView.S_IDLE);
 
         if (pcm.length < AsrEngine.SAMPLE_RATE / 5) {     // <0.2s 视为误触
-            pad.setState(VoicePadView.S_IDLE);
+            setPadState(VoicePadView.S_IDLE);
             return;
         }
         final boolean cloud = AsrSettings.isCloud(this);
@@ -724,7 +1388,8 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
             draft = "";
         }
         busy = true;
-        pad.setState(VoicePadView.S_ASR);
+        setPadState(VoicePadView.S_ASR);
+        final long generation = captureGeneration;
 
         new Thread(() -> {
             long t0 = System.currentTimeMillis();
@@ -740,7 +1405,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
                     }
                     if (!e.isReady()) {
                         final String err = e.loadError();
-                        ui.post(() -> { busy = false; pad.setState(VoicePadView.S_ERR); });
+                        ui.post(() -> { busy = false; setPadState(VoicePadView.S_ERR); });
                         return;
                     }
                     text = e.transcribe(pcm, AsrEngine.SAMPLE_RATE);
@@ -748,7 +1413,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
             } catch (Throwable ex) {
                 Log.e(TAG, "转写异常", ex);
                 final String m = ex.getMessage();
-                ui.post(() -> { busy = false; pad.setState(VoicePadView.S_ERR); Log.w(TAG, "转写失败：" + m); });
+                ui.post(() -> { busy = false; setPadState(VoicePadView.S_ERR); Log.w(TAG, "转写失败：" + m); });
                 return;
             }
             final int cost = (int) (System.currentTimeMillis() - t0);
@@ -760,13 +1425,16 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
             final String committed = finalText;
 
             ui.post(() -> {
+                if (generation != captureGeneration) return;
+                cancelCaptureIfTargetChanged("ASR callback");
+                if (generation != captureGeneration) return;
                 busy = false;
                 if (committed.isEmpty()) {
-                    pad.setState(VoicePadView.S_ERR);
+                    setPadState(VoicePadView.S_ERR);
                     return;
                 }
                 doCommit(committed, false);
-                pad.setState(VoicePadView.S_DONE);        // 描边闪一次绿
+                setPadState(VoicePadView.S_DONE);        // 描边闪一次绿
 
                 // AI 润色（可选，纯文本请求；失败就保持原文）
                 if (AsrSettings.polishEnabled(VoiceImeService.this)
@@ -777,13 +1445,16 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
                             String better = CloudPolish.polish(VoiceImeService.this, committed);
                             if (better == null || better.isEmpty() || better.equals(committed)) return;
                             ui.post(() -> {
-                                InputConnection ic = getCurrentInputConnection();
-                                if (ic == null) return;
+                                if (generation != captureGeneration) return;
+                                cancelCaptureIfTargetChanged("polish callback");
+                                if (generation != captureGeneration) return;
+                                InputConnection ic = recTargetConnection;
+                                if (ic == null || ic != getCurrentInputConnection()) return;
                                 try {
                                     ic.deleteSurroundingText(committedLen, 0);
                                     ic.commitText(better, 1);
                                     lastCommitLen = better.length();
-                                    pad.setState(VoicePadView.S_DONE);
+                                    setPadState(VoicePadView.S_DONE);
                                 } catch (Throwable e) {
                                     Log.w(TAG, "润色替换失败", e);
                                 }
@@ -797,8 +1468,9 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
                         + (cloud ? "云端" : "本机") + " / 音频 " + dur + "s");
                 // 绿闪结束后回到空闲色（胶囊外形不变）
                 ui.postDelayed(() -> {
-                    if (!busy && pad != null && pad.getState() == VoicePadView.S_DONE) {
-                        pad.setState(VoicePadView.S_IDLE);
+                    if (generation != captureGeneration) return;
+                    if (!busy && pad != null && activePadState() == VoicePadView.S_DONE) {
+                        setPadState(VoicePadView.S_IDLE);
                     }
                 }, 600);
             });
@@ -889,8 +1561,8 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     /** 双击胶囊空白处：收起输入法（回到系统默认输入法） */
     @Override
     public void onCollapse() {
-        if (recorder != null && recorder.isRecording()) recorder.cancel();
-        recorder = null;
+        dismissClipboardHistory();
+        cancelCapture("capsule collapsed");
         requestHideSelf(0);
     }
 
@@ -913,27 +1585,27 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
         // 录音时草稿会不断写进输入框，WebView 可能因此重新绑定输入法并再次调用
         // onStartInputView —— 旧写法此时会把红色麦克风刷回蓝色，看起来像"没在录"。
         if (recorder != null && recorder.isRecording()) {
-            pad.setState(VoicePadView.S_REC);
+            setPadState(VoicePadView.S_REC);
             return;
         }
         if (busy) {
-            pad.setState(VoicePadView.S_ASR);
+            setPadState(VoicePadView.S_ASR);
             return;
         }
-        int st = pad.getState();
+        int st = activePadState();
         if (st == VoicePadView.S_REC || st == VoicePadView.S_ASR) return;
 
         if (AsrSettings.isCloud(this)) {
-            pad.setState(VoicePadView.S_IDLE);
+            setPadState(VoicePadView.S_IDLE);
             return;
         }
         AsrEngine e = AsrEngine.get(this);
         if (e.isReady() || e.isLoading()) {
-            pad.setState(VoicePadView.S_IDLE);
+            setPadState(VoicePadView.S_IDLE);
         } else if (!e.modelPresent()) {
-            pad.setState(VoicePadView.S_ERR);
+            setPadState(VoicePadView.S_ERR);
         } else {
-            pad.setState(VoicePadView.S_IDLE);
+            setPadState(VoicePadView.S_IDLE);
         }
     }
 

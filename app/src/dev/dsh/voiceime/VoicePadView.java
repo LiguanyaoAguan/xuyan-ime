@@ -3,72 +3,79 @@ package dev.dsh.voiceime;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
-import android.graphics.Typeface;
-import android.text.TextPaint;
 import android.util.AttributeSet;
 import android.view.MotionEvent;
 import android.view.View;
 
 /**
- * VoicePad v3.2 · 三键常驻胶囊（设计稿：176×56dp，圆角 28dp）。
+ * 序言 · 主胶囊 v1.1（五区版）
  *
- *   [ 🎤 44 ]   [ ↵ 40 ]   [ ⌫ 40 ]        ← 全部无文字，只靠颜色表达状态
+ *   ┌────────────────────────────────────────────┐
+ *   │  🎤   │  剪贴板  │   ↵   │   ⌫   ║ 把手    │   240 × 56dp
+ *   └────────────────────────────────────────────┘
+ *    44dp     44dp      44dp    44dp     44dp
+ *   两侧留白 10dp，五个触控区紧挨着，把手前有一条极浅分隔线。
  *
  * 交互：
- *   点麦克风        开始 / 停止录音
- *   点 ↵            插入换行（commitText("\n")，**绝不模拟 Enter**）
- *   点 ⌫            退一个字
- *   长按 ⌫          连续退（400ms 后每 70ms）
- *   按住 ⌫ 上滑 28dp 进入清空预备态（变红），松手清空，滑回来取消
- *   空白处拖动       自由移动窗口（不吸边），松手记住位置
- *   长按空白处       展开 L2 面板（预留）
- *   双击空白处       收起输入法
+ *   点麦克风      开始 / 停止录音
+ *   按住麦克风    250ms 后开始录，松手结束
+ *   点剪贴板      粘贴系统剪贴板文本
+ *   长按剪贴板    450ms 打开剪贴板历史（松手不再触发粘贴）
+ *   点 ↵          安全换行（DSH 走 Shift+Enter）
+ *   点 ⌫          退一个字
+ *   长按 ⌫        连删
+ *   按住 ⌫ 上滑   28dp 进入清空预备，松手清空
+ *   按住把手拖    整个胶囊跟手移动，松手记住位置
+ *   拖空白区      也可移动（辅助）
+ *   双击空白      收起输入法
  *
- * 窗口尺寸 == 胶囊尺寸，所以本视图等于“整个窗口”，绘制从 (0,0) 开始铺满。
+ * 原 L2 面板已停用：功能并入主胶囊与设置页。
  */
 public class VoicePadView extends View {
 
     public interface Callback {
-        void onMicToggle();      // 单击：切换录音
-        void onMicHoldStart();   // 按住：开始录音
-        void onMicHoldEnd();     // 松开：结束并识别
+        void onMicToggle();
+        void onMicHoldStart();
+        void onMicHoldEnd();
         void onEnter();
         void onUndo();
         void onClearAll();
+        void onPasteClipboard();
+        void onClipboardHistory();
+        void onToggleKeyboard();
         void onCollapse();
-        void onExpandPanel();    // 长按空白：展开/收起 L2 面板
-        void onUndoLast();       // 面板里的“撤销”：撤掉上一次上屏
-        void onOpenSettings();   // 面板里的“设置”
-        void onPasteClipboard(); // 面板里的“剪贴板”
-        void onToggleLanguage(); // 面板里的“语言”
-        void onMoveTo(int x, int y);          // 窗口左上角（屏幕坐标 px）
+        void onMoveTo(int x, int y);
         void onMoveEnd(int x, int y);
     }
 
-    // ---------------------------------------------------------------- 尺寸(dp)
-    public static final float W = 216f;
-    public static final float H = 56f;
-    private static final float MIC = 44f;
-    private static final float BTN = 40f;
-    private static final float SMALL = 34f;      // 收起键（略小，视觉次要）
-    private static final float GAP = 8f;
-    private static final float ICON = 20f;
-    private static final float SLOP_DRAG = 12f;     // 超过才算拖动
+    public static final int S_IDLE = 0, S_REC = 1, S_ASR = 2, S_DONE = 3, S_ERR = 4;
 
-    // L2 面板（设计稿 252×204dp，圆角 24）
-    public static final float PW = 252f;
-    public static final float PH = 192f;
-    private static final float PR = 24f;
-    private static final float CELL_W = 110f;
-    private static final float CELL_H = 52f;
-    private static final float KEYS_Y = 132f;       // 四键行顶部
-    private static final float SMALL_ICON = 20f;
-    private static final float SLOP_CLEAR = 28f;    // 删除上滑阈值
+    // ---------------------------------------------------------------- 尺寸(dp)
+    public static final float W = 264f;
+    public static final float H = 56f;
+    public static final float EXPANDED_H = 302f;
+    /** 窗口比底板每侧多留的透明边（避免系统窗口圆角的边缘痕迹） */
+    public static final float PAD = 4f;
+
+    private static final float CELL = 44f;       // 四个功能键各 44dp
+    private static final float HANDLE_W = 34f;   // 把手区域更窄
+    private static final float KEYBOARD_W = 38f; // 删除键后紧接键盘，右端独立保留拖动区
+    private static final float EDGE = 10f;      // 两侧留白
+    private static final float ICON = 20f;
+
+    private static final float SLOP_DRAG = 10f;
+    private static final float SLOP_CLEAR = 28f;
+    private static final long HOLD_MIC = 250;
+    private static final long HOLD_CLIP = 450;
+    private static final long LONG_DEL = 400;
+    private static final long REPEAT_DEL = 70;
 
     // ---------------------------------------------------------------- 颜色
     private static final int C_BG      = 0xF01A1D23;
     private static final int C_BORDER  = 0x24FFFFFF;
+    private static final int C_DIV     = 0x1AFFFFFF;
     private static final int C_BTN     = 0xFFAEB9CA;
     private static final int C_BLUE    = 0xFF60A5FA;
     private static final int C_BLUE_BG = 0x1A3B82F6;
@@ -78,75 +85,54 @@ public class VoicePadView extends View {
     private static final int C_AMBER   = 0xFFFBBF24;
     private static final int C_GREEN   = 0xFF22C55E;
 
-    public static final int S_IDLE = 0, S_REC = 1, S_ASR = 2, S_DONE = 3, S_ERR = 4;
-
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final TextPaint text = new TextPaint(Paint.ANTI_ALIAS_FLAG);
 
     private final RectF micRect = new RectF();
+    private final RectF clipRect = new RectF();
     private final RectF enterRect = new RectF();
     private final RectF delRect = new RectF();
-    private final RectF collapseRect = new RectF();
-    private final RectF cell1 = new RectF();   // 撤销
-    private final RectF cell2 = new RectF();   // 历史
-    private final RectF cell3 = new RectF();   // 语言
-    private final RectF cell4 = new RectF();   // 设置
-    private final RectF panelClose = new RectF();
+    private final RectF handleRect = new RectF();
+    private final RectF keyboardRect = new RectF();
 
     private Callback cb;
+    private boolean expandedKeyboard;
     private int state = S_IDLE;
     private float level;
     private long doneAt;
 
-    private int winX, winY;                 // 窗口左上角（屏幕坐标）
-    private int pressed = -1;               // 0 mic 1 enter 2 del 3 blank
+    private int winX, winY;
+    private int pressed = -1;          // 0麦 1剪贴板 2换行 3删除 4把手 5空白
     private boolean dragging;
     private boolean clearArmed;
     private boolean undoRepeating;
+    private boolean holdMode;
+    private boolean clipLongFired;
     private long lastTap;
     private float downRawX, downRawY, maxDisp;
-    private int dragStartWinX, dragStartWinY;
+    private int dragStartX, dragStartY;
 
-    /**
-     * 长按空白：展开 / 收起 L2 面板。
-     * （收起键盘由右侧 ⌄ 按钮负责，别再绑到长按上，否则一按就把键盘关了）
-     */
-    private final Runnable longPressBlank = () -> {
-        if (pressed == 4 && !dragging) {
-            pressed = -1;
-            if (cb != null) cb.onExpandPanel();
-        }
-    };
-    private static final float HOLD_DELAY = 250f;   // 超过这个时间算“按住”
-    private boolean longFired;      // 箭头已被长按消费
-    private boolean holdMode;                       // 当前是按住录音
-
-    private final Runnable holdStart = () -> {
+    private final Runnable micHold = () -> {
         if (pressed != 0) return;
         holdMode = true;
         if (cb != null) cb.onMicHoldStart();
     };
-    /** 箭头长按：直接进入拖动（单击是开/关面板） */
-    private final Runnable arrowLongPress = () -> {
-        if (pressed == 3) {
-            dragging = true;
-            longFired = true;
-            invalidate();
-        }
+    private final Runnable clipHold = () -> {
+        if (pressed != 1) return;
+        clipLongFired = true;
+        if (cb != null) cb.onClipboardHistory();
     };
-
-    private final Runnable undoRepeat = () -> {
-        if (pressed != 2 || !undoRepeating || clearArmed) return;
+    private final Runnable delRepeat = () -> {
+        if (pressed != 3 || !undoRepeating || clearArmed) return;
         if (cb != null) cb.onUndo();
-        postDelayed(this.undoRepeat, 70);
+        postDelayed(this.delRepeat, REPEAT_DEL);
     };
-    private final Runnable undoStart = () -> {
-        if (pressed != 2) return;
+    private final Runnable delStart = () -> {
+        if (pressed != 3) return;
         undoRepeating = true;
         if (cb != null) cb.onUndo();
         invalidate();
-        postDelayed(undoRepeat, 70);
+        postDelayed(delRepeat, REPEAT_DEL);
     };
 
     private float density;
@@ -158,13 +144,14 @@ public class VoicePadView extends View {
         density = getResources().getDisplayMetrics().density;
         stroke.setStyle(Paint.Style.STROKE);
         stroke.setStrokeCap(Paint.Cap.ROUND);
+        stroke.setStrokeJoin(Paint.Join.ROUND);
         fill.setStyle(Paint.Style.FILL);
     }
 
     public void setCallback(Callback c) { this.cb = c; }
-
     public void setWindowPos(int x, int y) { winX = x; winY = y; }
-
+    public void setExpandedKeyboard(boolean expanded) { expandedKeyboard=expanded; invalidate(); }
+    public boolean hasExpandedKeyboard() { return expandedKeyboard; }
     public int getState() { return state; }
 
     public void setState(int s) {
@@ -185,44 +172,30 @@ public class VoicePadView extends View {
 
     @Override
     protected void onMeasure(int wSpec, int hSpec) {
-        // 窗口尺寸由 Service 决定（胶囊 208×56 / 面板 252×204），这里照它给的大小走
         int w = MeasureSpec.getSize(wSpec);
         int h = MeasureSpec.getSize(hSpec);
-        if (w <= 0) w = (int) dp(W);
-        if (h <= 0) h = (int) dp(H);
+        if (w <= 0) w = (int) dp(W + PAD * 2);
+        if (h <= 0) h = (int) dp(H + PAD * 2);
+        if (expandedKeyboard) h=MeasureSpec.getSize(hSpec)>0?MeasureSpec.getSize(hSpec):(int)dp(H+PAD*2);
         setMeasuredDimension(w, h);
     }
 
-    /** 当前是不是面板形态（按高度判断，够稳） */
-    public boolean isPanel() { return getHeight() > dp(H + 24); }
-
     private void layoutSlots() {
-        float w = getWidth(), h = getHeight();
-        float total = dp(MIC + GAP + BTN + GAP + BTN + GAP + SMALL);
-        float pad = Math.max(0, (w - total) / 2f);
+        float h = getHeight();
+        float edge = dp(EDGE + PAD);
+        float cw = dp(CELL);
         float cy = h / 2f;
-        float keysTop = 0;
 
-        if (isPanel()) {
-            // 规则网格：两列两行 + 底部三键行
-            float left = dp(12), top = dp(12);
-            float col2 = dp(12 + CELL_W + 8);
-            cell1.set(left, top, left + dp(CELL_W), top + dp(CELL_H));
-            cell2.set(col2, top, col2 + dp(CELL_W), top + dp(CELL_H));
-            cell3.set(left, top + dp(CELL_H + 6), left + dp(CELL_W), top + dp(CELL_H * 2 + 6));
-            cell4.set(col2, top + dp(CELL_H + 6), col2 + dp(CELL_W), top + dp(CELL_H * 2 + 6));
-            panelClose.setEmpty();          // 面板不再单独放收起键
-            cy = dp(KEYS_Y) + dp(MIC) / 2f;
-        }
-
-        float x = pad;
-        micRect.set(x, cy - dp(MIC) / 2f, x + dp(MIC), cy + dp(MIC) / 2f);
-        x += dp(MIC + GAP);
-        enterRect.set(x, cy - dp(BTN) / 2f, x + dp(BTN), cy + dp(BTN) / 2f);
-        x += dp(BTN + GAP);
-        delRect.set(x, cy - dp(BTN) / 2f, x + dp(BTN), cy + dp(BTN) / 2f);
-        x += dp(BTN + GAP);
-        collapseRect.set(x, cy - dp(SMALL) / 2f, x + dp(SMALL), cy + dp(SMALL) / 2f);
+        float x = edge;
+        float capsuleKeyboardWidth=dp(expandedKeyboard?0:KEYBOARD_W);
+        float visibleHandleWidth=dp(expandedKeyboard?0:HANDLE_W);
+        micRect.set(x, cy - cw / 2f, x + cw, cy + cw / 2f); x += cw;
+        clipRect.set(x, cy - cw / 2f, x + cw, cy + cw / 2f); x += cw;
+        enterRect.set(x, cy - cw / 2f, x + cw, cy + cw / 2f); x += cw;
+        delRect.set(x, cy - cw / 2f, x + cw, cy + cw / 2f); x += cw;
+        float kw=capsuleKeyboardWidth; keyboardRect.set(x,cy-cw/2f,x+kw,cy+cw/2f); x+=kw;
+        float hw=expandedKeyboard?0:Math.max(visibleHandleWidth,getWidth()-edge-x);
+        handleRect.set(x,cy-cw/2f,x+hw,cy+cw/2f);
     }
 
     // ---------------------------------------------------------------- 绘制
@@ -230,19 +203,17 @@ public class VoicePadView extends View {
     @Override
     protected void onDraw(Canvas c) {
         layoutSlots();
-        boolean panel = isPanel();
-        float r = panel ? dp(PR) : (getHeight() - dp(2)) / 2f;
-
-        // 底板往里收 1.5dp：系统对悬浮窗有圆角裁剪，画到边缘会在弧外露出灰边
-        float inset = dp(panel ? 1.5f : 1.0f);
+        float inset = dp(PAD);
         RectF shell = new RectF(inset, inset, getWidth() - inset, getHeight() - inset);
+        float r = shell.height() / 2f;
+
         fill.setColor(C_BG);
         c.drawRoundRect(shell, r, r, fill);
         stroke.setStrokeWidth(dp(1));
         stroke.setColor(state == S_DONE ? flashColor() : C_BORDER);
         c.drawRoundRect(shell, r, r, stroke);
 
-        // 录音外圈呼吸
+        // 录音呼吸环
         if (state == S_REC) {
             long t = System.currentTimeMillis();
             float phase = (t % 800) / 800f;
@@ -250,7 +221,8 @@ public class VoicePadView extends View {
             stroke.setStrokeWidth(dp(2));
             stroke.setColor((alpha << 24) | 0x00FF6969);
             float grow = dp(2) + dp(3) * phase + level * dp(2);
-            RectF g = new RectF(-grow, -grow, getWidth() + grow, getHeight() + grow);
+            RectF g = new RectF(shell.left - grow, shell.top - grow,
+                    shell.right + grow, shell.bottom + grow);
             c.drawRoundRect(g, r + grow, r + grow, stroke);
         }
 
@@ -260,136 +232,52 @@ public class VoicePadView extends View {
         else if (state == S_ERR) { micColor = C_AMBER; micBg = 0x14F59E0B; }
 
         fill.setColor(micBg);
-        c.drawCircle(micRect.centerX(), micRect.centerY(), micRect.width() / 2f, fill);
+        c.drawCircle(micRect.centerX(), micRect.centerY(), micRect.width() / 2f - dp(2), fill);
         drawMic(c, micRect.centerX(), micRect.centerY(), dp(ICON), micColor);
 
         int btnColor = clearArmed ? C_RED : C_BTN;
-        if (state == S_DONE) btnColor = C_BTN;
 
-        // ↵ 换行
         if (pressed == 1) {
             fill.setColor(0x18FFFFFF);
-            c.drawCircle(enterRect.centerX(), enterRect.centerY(), enterRect.width() / 2f, fill);
+            c.drawCircle(clipRect.centerX(), clipRect.centerY(), clipRect.width() / 2f - dp(4), fill);
         }
-        drawEnter(c, enterRect.centerX(), enterRect.centerY(), dp(ICON), btnColor);
+        drawClipboard(c, clipRect.centerX(), clipRect.centerY(), dp(ICON), btnColor);
 
-        // ⌫ 删除（上滑清空预备态：红底 + 红图标）
-        if (clearArmed || pressed == 2) {
-            fill.setColor(clearArmed ? C_RED_BG : 0x18FFFFFF);
-            c.drawCircle(delRect.centerX(), delRect.centerY(), delRect.width() / 2f, fill);
-        }
-        drawDelete(c, delRect.centerX(), delRect.centerY(), dp(ICON), btnColor);
-
-        // ⌄ 收起键盘
-        if (pressed == 3) {
+        if (pressed == 2) {
             fill.setColor(0x18FFFFFF);
-            c.drawCircle(collapseRect.centerX(), collapseRect.centerY(),
-                    collapseRect.width() / 2f, fill);
+            c.drawCircle(enterRect.centerX(), enterRect.centerY(), enterRect.width() / 2f - dp(4), fill);
         }
-        drawChevron(c, collapseRect.centerX(), collapseRect.centerY(), dp(ICON), C_BTN, panel);
+        drawReturn(c, enterRect.centerX(), enterRect.centerY(), dp(ICON), btnColor);
 
-        if (panel) drawPanel(c);
+        if (clearArmed || pressed == 3) {
+            fill.setColor(clearArmed ? C_RED_BG : 0x18FFFFFF);
+            c.drawCircle(delRect.centerX(), delRect.centerY(), delRect.width() / 2f - dp(4), fill);
+        }
+        drawBackspace(c, delRect.centerX(), delRect.centerY(), dp(ICON), btnColor);
+
+        // 删除键后的功能区/拖动区分隔：小竖线之前依次是删除与键盘按钮
+        stroke.setStrokeWidth(dp(1));
+        stroke.setColor(C_DIV);
+        if (!expandedKeyboard) {
+            float lx = (keyboardRect.right + handleRect.left) / 2f;
+            c.drawLine(lx, shell.top + dp(14), lx, shell.bottom - dp(14), stroke);
+            if (pressed == 4) {
+                fill.setColor(0x14FFFFFF);
+                c.drawCircle(handleRect.centerX(), handleRect.centerY(),
+                        handleRect.width() / 2f - dp(2), fill);
+            }
+            drawHandle(c, handleRect.centerX(), handleRect.centerY(), dp(13));
+        }
+        if (pressed == 5) {
+            fill.setColor(0x18FFFFFF);
+            c.drawCircle(keyboardRect.centerX(), keyboardRect.centerY(), keyboardRect.width() / 2f - dp(2), fill);
+        }
+        if (!expandedKeyboard) drawKeyboard(c, keyboardRect.centerX(), keyboardRect.centerY(), dp(16), C_BTN);
 
         if (state == S_REC) postInvalidateDelayed(50);
         if (state == S_DONE && System.currentTimeMillis() - doneAt < 500) postInvalidateDelayed(60);
     }
 
-    /** L2 面板：2×2 功能格 + 右上角收起 */
-    private void drawPanel(Canvas c) {
-        float rad = dp(11);
-        drawCell(c, cell1, ICON_UNDO, "撤销", true, rad);
-        drawCell(c, cell2, ICON_CLIP, "剪贴板", true, rad);
-        drawCell(c, cell3, ICON_LANG, "语言", true, rad);
-        drawCell(c, cell4, ICON_GEAR, "设置", true, rad);
-
-        // 右上角收起（从面板回到胶囊）
-        stroke.setStrokeWidth(dp(2));
-        stroke.setColor(C_BTN);
-        float cx = panelClose.centerX(), cy = panelClose.centerY(), k = dp(6);
-        c.drawLine(cx - k, cy - k * 0.4f, cx, cy + k * 0.6f, stroke);
-        c.drawLine(cx, cy + k * 0.6f, cx + k, cy - k * 0.4f, stroke);
-    }
-
-    // 面板图标类型（全部 Canvas 手绘，不依赖系统字体，避免出现豆腐块/灰点）
-    private static final int ICON_UNDO = 0, ICON_CLIP = 1, ICON_LANG = 2, ICON_GEAR = 3;
-
-    private void drawCell(Canvas c, RectF box, int icon, String label,
-                          boolean enabled, float rad) {
-        fill.setColor(pressed == cellIndex(box) ? 0x1FFFFFFF : 0x10FFFFFF);
-        c.drawRoundRect(box, rad, rad, fill);
-        stroke.setStrokeWidth(dp(1));
-        stroke.setColor(0x14FFFFFF);
-        c.drawRoundRect(box, rad, rad, stroke);
-
-        int col = enabled ? C_BTN : 0xFF5A6270;
-        drawCellIcon(c, icon, box.centerX(), box.top + dp(20), dp(15), col);
-
-        TextPaint t = text;
-        t.setTypeface(Typeface.DEFAULT);
-        t.setTextAlign(Paint.Align.CENTER);
-        t.setTextSize(dp(11));
-        t.setColor(col);
-        c.drawText(label, box.centerX(), box.top + dp(40), t);
-        t.setTextAlign(Paint.Align.LEFT);
-    }
-
-    /** 四种小图标：撤销 / 剪贴板 / 语言 / 设置 */
-    private void drawCellIcon(Canvas c, int type, float cx, float cy, float size, int color) {
-        float k = size / 24f;
-        float l = cx - 12f * k, t = cy - 12f * k;
-        stroke.setStrokeWidth(2.0f * k);
-        stroke.setColor(color);
-        stroke.setStrokeCap(Paint.Cap.ROUND);
-        fill.setColor(color);
-
-        switch (type) {
-            case ICON_UNDO: {   // 逆时针弧 + 箭头
-                c.drawArc(new RectF(l + 5f * k, t + 6f * k, l + 19f * k, t + 20f * k),
-                        30f, -260f, false, stroke);
-                c.drawLine(l + 5f * k, t + 6f * k, l + 5f * k, t + 12f * k, stroke);
-                c.drawLine(l + 5f * k, t + 6f * k, l + 11f * k, t + 6f * k, stroke);
-                break;
-            }
-            case ICON_CLIP: {   // 剪贴板：板 + 顶部夹子 + 两行字
-                RectF body = new RectF(l + 5f * k, t + 5f * k, l + 19f * k, t + 21f * k);
-                c.drawRoundRect(body, 2.5f * k, 2.5f * k, stroke);
-                c.drawRoundRect(new RectF(l + 9f * k, t + 2f * k, l + 15f * k, t + 7f * k),
-                        1.5f * k, 1.5f * k, stroke);
-                c.drawLine(l + 8f * k, t + 11f * k, l + 16f * k, t + 11f * k, stroke);
-                c.drawLine(l + 8f * k, t + 15f * k, l + 14f * k, t + 15f * k, stroke);
-                break;
-            }
-            case ICON_LANG: {   // 地球样式：圆 + 竖椭圆 + 横线
-                c.drawCircle(cx, cy, 9f * k, stroke);
-                c.drawOval(new RectF(cx - 4f * k, cy - 9f * k, cx + 4f * k, cy + 9f * k), stroke);
-                c.drawLine(cx - 9f * k, cy, cx + 9f * k, cy, stroke);
-                break;
-            }
-            default: {          // 齿轮：圆 + 中心圆 + 四根齿
-                c.drawCircle(cx, cy, 6.5f * k, stroke);
-                c.drawCircle(cx, cy, 2.4f * k, fill);
-                for (int i = 0; i < 4; i++) {
-                    double a = Math.PI / 4 + i * Math.PI / 2;
-                    float x1 = (float) (cx + Math.cos(a) * 7.5f * k);
-                    float y1 = (float) (cy + Math.sin(a) * 7.5f * k);
-                    float x2 = (float) (cx + Math.cos(a) * 11f * k);
-                    float y2 = (float) (cy + Math.sin(a) * 11f * k);
-                    c.drawLine(x1, y1, x2, y2, stroke);
-                }
-                break;
-            }
-        }
-        stroke.setStrokeCap(Paint.Cap.BUTT);
-    }
-
-    private int cellIndex(RectF box) {
-        if (box == cell1) return 5;
-        if (box == cell2) return 6;
-        if (box == cell4) return 8;
-        return -1;
-    }
-
-    /** 完成时描边闪一次绿 */
     private int flashColor() {
         long dt = System.currentTimeMillis() - doneAt;
         if (dt > 500) return C_BORDER;
@@ -397,92 +285,105 @@ public class VoicePadView extends View {
         return (a << 24) | 0x0022C55E;
     }
 
-    /** 麦克风：胶囊 + 下半圆弧 + 支架（设计稿 SVG 等比） */
     private void drawMic(Canvas c, float cx, float cy, float size, int color) {
         float k = size / 24f;
         float l = cx - 12f * k, t = cy - 12f * k;
         fill.setColor(color);
         c.drawRoundRect(new RectF(l + 9f * k, t + 3f * k, l + 15f * k, t + 15f * k),
                 3f * k, 3f * k, fill);
-        stroke.setStrokeWidth(2.2f * k);
+        stroke.setStrokeWidth(2.1f * k);
         stroke.setColor(color);
-        c.drawArc(new RectF(l + 5f * k, t + 4f * k, l + 19f * k, t + 18f * k),
-                0f, 180f, false, stroke);
+        c.drawArc(new RectF(l + 5f * k, t + 4f * k, l + 19f * k, t + 18f * k), 0f, 180f, false, stroke);
         c.drawLine(cx, t + 18f * k, cx, t + 21f * k, stroke);
         c.drawLine(l + 8f * k, t + 21f * k, l + 16f * k, t + 21f * k, stroke);
     }
 
-    /** ↵ 弯箭头：头部在左，横线向右再上折 */
-    private void drawEnter(Canvas c, float cx, float cy, float size, int color) {
+    private void drawKeyboard(Canvas c, float cx, float cy, float size, int color) {
         float k = size / 24f;
-        float l = cx - 12f * k, t = cy - 12f * k;
-        stroke.setStrokeWidth(2.2f * k);
+        float l = cx - 12f * k, t = cy - 9f * k;
+        stroke.setStrokeWidth(1.8f * k);
         stroke.setColor(color);
-        float ax = l + 9f * k, ay = t + 10f * k;
-        float bx = l + 5f * k, by = t + 14f * k;
-        float dx = l + 9f * k, dy = t + 18f * k;
-        c.drawLine(ax, ay, bx, by, stroke);
-        c.drawLine(bx, by, dx, dy, stroke);
-        c.drawLine(bx, by, l + 15f * k, by, stroke);
-        c.drawArc(new RectF(l + 11f * k, t + 6f * k, l + 19f * k, t + 14f * k),
-                90f, -90f, false, stroke);
-        c.drawLine(l + 19f * k, t + 10f * k, l + 19f * k, t + 5f * k, stroke);
+        c.drawRoundRect(new RectF(l + 3f * k, t + 2f * k, l + 21f * k, t + 16f * k),
+                2f * k, 2f * k, stroke);
+        for (int row = 0; row < 2; row++) {
+            for (int col = 0; col < 4; col++) {
+                float x = l + (6f + col * 4f) * k;
+                float y = t + (7f + row * 4f) * k;
+                c.drawCircle(x, y, 0.8f * k, stroke);
+            }
+        }
+        c.drawLine(l + 9f * k, t + 21f * k, l + 15f * k, t + 21f * k, stroke);
     }
 
-    /**
-     * ⌫ 删除键：左边尖角 + 圆角矩形身，里面一个小叉。
-     * 比旧版更宽扁、线条更细、转角更圆，20dp 下也不会糊成一团。
-     */
-    private void drawDelete(Canvas c, float cx, float cy, float size, int color) {
+    /** 剪贴板：竖向圆角板 + 顶部夹子 + 两条内容线 */
+    private void drawClipboard(Canvas c, float cx, float cy, float size, int color) {
         float k = size / 24f;
         float l = cx - 12f * k, t = cy - 12f * k;
+        stroke.setStrokeWidth(2.0f * k);
+        stroke.setColor(color);
+        c.drawRoundRect(new RectF(l + 5f * k, t + 4f * k, l + 19f * k, t + 21f * k),
+                2.5f * k, 2.5f * k, stroke);
+        c.drawRoundRect(new RectF(l + 9f * k, t + 2f * k, l + 15f * k, t + 7f * k),
+                1.6f * k, 1.6f * k, stroke);
+        c.drawLine(l + 8.5f * k, t + 11f * k, l + 15.5f * k, t + 11f * k, stroke);
+        c.drawLine(l + 8.5f * k, t + 15f * k, l + 13.5f * k, t + 15f * k, stroke);
+    }
 
+    /** 换行：标准 Return 符号（横线 + 右端圆角上折 + 左端箭头） */
+    private void drawReturn(Canvas c, float cx, float cy, float size, int color) {
+        float k = size / 24f;
+        float l = cx - 12f * k, t = cy - 12f * k;
+        stroke.setStrokeWidth(2.0f * k);
+        stroke.setColor(color);
+
+        float y = t + 15f * k;
+        float x0 = l + 4.5f * k;
+        float x1 = l + 17f * k;
+
+        Path p = new Path();
+        p.moveTo(x0 + 3f * k, y);
+        p.lineTo(x1 - 3f * k, y);
+        p.quadTo(x1, y, x1, y - 3f * k);
+        p.lineTo(x1, t + 6.5f * k);
+        c.drawPath(p, stroke);
+
+        c.drawLine(x0 + 3f * k, y, x0 + 8f * k, y - 4.5f * k, stroke);
+        c.drawLine(x0 + 3f * k, y, x0 + 8f * k, y + 4.5f * k, stroke);
+    }
+
+    /** 删除：Backspace 轮廓 + 内部小叉 */
+    private void drawBackspace(Canvas c, float cx, float cy, float size, int color) {
+        float k = size / 24f;
+        float l = cx - 12f * k, t = cy - 12f * k;
         stroke.setStrokeWidth(1.9f * k);
         stroke.setColor(color);
-        stroke.setStrokeJoin(android.graphics.Paint.Join.ROUND);
 
-        float leftX = l + 2.5f * k;      // 尖角顶点
-        float topY  = t + 6f * k;
-        float botY  = t + 18f * k;
-        float cornerX = l + 8.5f * k;    // 尖角与矩形身的交界
-        float rightX = l + 21f * k;
+        float tip = l + 2.5f * k, top = t + 6.5f * k, bot = t + 17.5f * k;
+        float corner = l + 8.5f * k, right = l + 21f * k;
 
-        android.graphics.Path p = new android.graphics.Path();
-        p.moveTo(leftX, t + 12f * k);          // 尖
-        p.lineTo(cornerX, topY);               // 上斜边
-        p.lineTo(rightX - 2f * k, topY);       // 上边
-        p.quadTo(rightX, topY, rightX, topY + 2f * k);
-        p.lineTo(rightX, botY - 2f * k);
-        p.quadTo(rightX, botY, rightX - 2f * k, botY);
-        p.lineTo(cornerX, botY);               // 下边
+        Path p = new Path();
+        p.moveTo(tip, t + 12f * k);
+        p.lineTo(corner, top);
+        p.lineTo(right - 2f * k, top);
+        p.quadTo(right, top, right, top + 2f * k);
+        p.lineTo(right, bot - 2f * k);
+        p.quadTo(right, bot, right - 2f * k, bot);
+        p.lineTo(corner, bot);
         p.close();
         c.drawPath(p, stroke);
 
-        // 内部小叉（居中在矩形身里）
-        float mx = (cornerX + rightX) / 2f + 0.8f * k;
-        float s2 = 2.4f * k;
-        float my = t + 12f * k;
+        float mx = (corner + right) / 2f + 0.6f * k, my = t + 12f * k, s2 = 2.3f * k;
         c.drawLine(mx - s2, my - s2, mx + s2, my + s2, stroke);
         c.drawLine(mx + s2, my - s2, mx - s2, my + s2, stroke);
     }
 
-    /**
-     * 形态开关箭头：
-     *   胶囊态 → 尖朝上（∧）提示“会向上长开”
-     *   面板态 → 尖朝下（∨）提示“会收回”
-     */
-    private void drawChevron(Canvas c, float cx, float cy, float size, int color, boolean panel) {
-        float k = size / 24f;
-        float l = cx - 12f * k, t = cy - 12f * k;
-        stroke.setStrokeWidth(2.2f * k);
-        stroke.setColor(color);
-        if (panel) {   // ∨
-            c.drawLine(l + 5f * k, t + 9f * k, l + 12f * k, t + 16f * k, stroke);
-            c.drawLine(l + 12f * k, t + 16f * k, l + 19f * k, t + 9f * k, stroke);
-        } else {       // ∧
-            c.drawLine(l + 5f * k, t + 16f * k, l + 12f * k, t + 9f * k, stroke);
-            c.drawLine(l + 12f * k, t + 9f * k, l + 19f * k, t + 16f * k, stroke);
-        }
+    /** 拖动把手：两条细竖线（低对比度，不抢视觉） */
+    private void drawHandle(Canvas c, float cx, float cy, float h) {
+        stroke.setStrokeWidth(dp(2));
+        stroke.setColor(0xFF6B7789);
+        float d = dp(3);                 // 两线中心距 6dp
+        c.drawLine(cx - d, cy - h / 2f, cx - d, cy + h / 2f, stroke);
+        c.drawLine(cx + d, cy - h / 2f, cx + d, cy + h / 2f, stroke);
     }
 
     // ---------------------------------------------------------------- 触摸
@@ -494,135 +395,138 @@ public class VoicePadView extends View {
             case MotionEvent.ACTION_DOWN: {
                 downRawX = e.getRawX();
                 downRawY = e.getRawY();
-                dragStartWinX = winX;
-                dragStartWinY = winY;
+                dragStartX = winX;
+                dragStartY = winY;
+                maxDisp = 0f;
                 dragging = false;
                 clearArmed = false;
                 undoRepeating = false;
-                maxDisp = 0f;
-
                 holdMode = false;
+                clipLongFired = false;
+
                 if (micRect.contains(x, y)) {
                     pressed = 0;
-                    postDelayed(holdStart, (long) HOLD_DELAY);
-                } else if (enterRect.contains(x, y)) {
+                    postDelayed(micHold, HOLD_MIC);
+                } else if (clipRect.contains(x, y)) {
                     pressed = 1;
-                } else if (delRect.contains(x, y)) {
+                    postDelayed(clipHold, HOLD_CLIP);
+                } else if (enterRect.contains(x, y)) {
                     pressed = 2;
-                    postDelayed(undoStart, 400);
-                } else if (collapseRect.contains(x, y)) {
-                    longFired = false;
+                } else if (delRect.contains(x, y)) {
                     pressed = 3;
-                    postDelayed(arrowLongPress, 500);
-                } else if (isPanel() && cell1.contains(x, y)) {
-                    pressed = 5;                       // 撤销
-                } else if (isPanel() && cell2.contains(x, y)) {
-                    pressed = 6;                       // 历史（未开放）
-                } else if (isPanel() && cell3.contains(x, y)) {
-                    pressed = 7;                       // 语言（未开放）
-                } else if (isPanel() && cell4.contains(x, y)) {
-                    pressed = 8;                       // 设置
+                    postDelayed(delStart, LONG_DEL);
+                } else if (!expandedKeyboard && handleRect.contains(x, y)) {
+                    pressed = 4;
+                } else if (!expandedKeyboard && keyboardRect.contains(x, y)) {
+                    pressed = 6;
                 } else {
-                    pressed = 4;      // 空白：拖动 / 双击收起键盘
+                    pressed = expandedKeyboard ? 7 : 5;
                 }
                 invalidate();
                 return true;
             }
             case MotionEvent.ACTION_MOVE: {
-                float dxRaw = e.getRawX() - downRawX;
-                float dyRaw = e.getRawY() - downRawY;
-                maxDisp = Math.max(maxDisp, (float) Math.hypot(dxRaw, dyRaw));
+                float dx = e.getRawX() - downRawX;
+                float dy = e.getRawY() - downRawY;
+                maxDisp = Math.max(maxDisp, (float) Math.hypot(dx, dy));
 
-                if (pressed == 2) {
-                    // 删除键：上滑超过 28dp → 清空预备态
-                    boolean up = dyRaw < -dp(SLOP_CLEAR);
+                // 把手：按下后移动即拖动，不需要长按
+                if (pressed == 4) {
+                    if (!dragging && maxDisp > dp(SLOP_DRAG)) dragging = true;
+                    if (dragging && cb != null) {
+                        cb.onMoveTo(dragStartX + (int) dx, dragStartY + (int) dy);
+                    }
+                    return true;
+                }
+
+                // 删除键上滑清空
+                if (pressed == 3) {
+                    boolean up = dy < -dp(SLOP_CLEAR);
                     if (up != clearArmed) {
                         clearArmed = up;
                         if (up) {
                             undoRepeating = false;
-                            removeCallbacks(undoStart);
-                            removeCallbacks(undoRepeat);
+                            removeCallbacks(delStart);
+                            removeCallbacks(delRepeat);
                         }
                         invalidate();
                     }
                     return true;
                 }
 
-                // 箭头长按后进入拖动：跟手移动
-                if (pressed == 3 && dragging) {
-                    if (cb != null) cb.onMoveTo(dragStartWinX + (int) dxRaw, dragStartWinY + (int) dyRaw);
-                    return true;
-                }
+                // 键盘入口只接受点按，不把按键操作误识别为拖动。
+                if (pressed == 6) return true;
 
-                if (pressed == 4) {
-                    if (!dragging && (Math.abs(dxRaw) > dp(SLOP_DRAG) || Math.abs(dyRaw) > dp(SLOP_DRAG))) {
-                        dragging = true;
-                        removeCallbacks(longPressBlank);
-                    }
+                // 空白区拖动（辅助入口）
+                if (pressed == 5) {
+                    if (!dragging && maxDisp > dp(SLOP_DRAG)) dragging = true;
                     if (dragging && cb != null) {
-                        cb.onMoveTo(dragStartWinX + (int) dxRaw, dragStartWinY + (int) dyRaw);
+                        cb.onMoveTo(dragStartX + (int) dx, dragStartY + (int) dy);
                     }
                     return true;
                 }
 
-                // 按住说话模式：手指移动不取消（说话时手会抖）
+                // 按住麦克风时手抖不取消
                 if (holdMode) return true;
 
-                // 手指离开按钮就取消（拖动窗口时坐标会变，用 raw 判断）
-                if (pressed >= 0 && Math.hypot(dxRaw, dyRaw) > dp(BTN)) {
+                if (expandedKeyboard && pressed == 7) return true;
+                if (pressed >= 0 && maxDisp > dp(CELL)) {
                     pressed = -1;
-                    removeCallbacks(undoStart);
-                    removeCallbacks(undoRepeat);
+                    removeCallbacks(micHold);
+                    removeCallbacks(clipHold);
+                    removeCallbacks(delStart);
+                    removeCallbacks(delRepeat);
                     invalidate();
                 }
                 return true;
             }
             case MotionEvent.ACTION_UP: {
                 int p = pressed;
-                boolean wasRepeating = undoRepeating;
-                boolean wasArmed = clearArmed;
-                boolean wasDragging = dragging;
+                boolean wasDragging = dragging && maxDisp > dp(SLOP_DRAG);
+                boolean wasClear = clearArmed;
+                boolean wasRepeat = undoRepeating;
+                boolean wasHold = holdMode;
+                boolean wasClipLong = clipLongFired;
+
                 pressed = -1;
-                undoRepeating = false;
-                clearArmed = false;
                 dragging = false;
-                removeCallbacks(undoStart);
-                removeCallbacks(undoRepeat);
-                removeCallbacks(longPressBlank);
+                clearArmed = false;
+                undoRepeating = false;
+                holdMode = false;
+                clipLongFired = false;
+                removeCallbacks(micHold);
+                removeCallbacks(clipHold);
+                removeCallbacks(delStart);
+                removeCallbacks(delRepeat);
                 invalidate();
 
-                // 真正移动过才算拖动；只是抖一下就当点击
-                if (wasDragging && maxDisp > dp(SLOP_DRAG)) {
+                if (wasDragging) {
                     if (cb != null) cb.onMoveEnd(winX, winY);
                     return true;
                 }
+
                 if (p == 0) {
-                    removeCallbacks(holdStart);
-                    if (holdMode) {
-                        holdMode = false;
-                        if (cb != null) cb.onMicHoldEnd();
-                    } else {
-                        if (cb != null) cb.onMicToggle();
-                    }
+                    if (wasHold) { if (cb != null) cb.onMicHoldEnd(); }
+                    else { if (cb != null) cb.onMicToggle(); }
                     return true;
                 }
-                if (p == 1) { if (cb != null) cb.onEnter(); return true; }
-                if (p == 2) {
-                    if (wasArmed) { if (cb != null) cb.onClearAll(); }
-                    else if (!wasRepeating) { if (cb != null) cb.onUndo(); }
+                if (p == 1) {
+                    if (wasClipLong) return true;      // 长按已打开历史，松手不再粘贴
+                    if (cb != null) cb.onPasteClipboard();
                     return true;
                 }
+                if (p == 2) { if (cb != null) cb.onEnter(); return true; }
                 if (p == 3) {
-                    removeCallbacks(arrowLongPress);
-                    if (!longFired && cb != null) cb.onExpandPanel();   // 单击：开/关面板
+                    if (wasClear) { if (cb != null) cb.onClearAll(); }
+                    else if (!wasRepeat) { if (cb != null) cb.onUndo(); }
                     return true;
                 }
-                if (p == 9) { if (cb != null) cb.onExpandPanel(); return true; }   // 面板 → 胶囊
-                if (p == 5) { if (cb != null) cb.onUndoLast(); return true; }
-                if (p == 8) { if (cb != null) cb.onOpenSettings(); return true; }
-                if (p == 6) { if (cb != null) cb.onPasteClipboard(); return true; }
-                if (p == 7) { if (cb != null) cb.onToggleLanguage(); return true; }
-                if (p == 4) {
+                if (p == 4 || (expandedKeyboard && p == 7)) return true;
+                if (p == 6) {
+                    if (cb != null) cb.onToggleKeyboard();
+                    return true;
+                }
+                if (p == 5) {
                     long now = System.currentTimeMillis();
                     if (now - lastTap < 400) {
                         lastTap = 0;
@@ -635,15 +539,15 @@ public class VoicePadView extends View {
             }
             case MotionEvent.ACTION_CANCEL: {
                 pressed = -1;
-                undoRepeating = false;
-                clearArmed = false;
                 dragging = false;
-                removeCallbacks(undoStart);
-                removeCallbacks(undoRepeat);
-                removeCallbacks(longPressBlank);
-                removeCallbacks(holdStart);
-                removeCallbacks(arrowLongPress);
+                clearArmed = false;
+                undoRepeating = false;
                 holdMode = false;
+                clipLongFired = false;
+                removeCallbacks(micHold);
+                removeCallbacks(clipHold);
+                removeCallbacks(delStart);
+                removeCallbacks(delRepeat);
                 invalidate();
                 return true;
             }

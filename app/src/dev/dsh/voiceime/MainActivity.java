@@ -38,7 +38,7 @@ public class MainActivity extends Activity {
     private static final int REQ_AUDIO = 1001;
 
     private static final String[] PAGES = {
-            "总览", "语音识别", "输入与外观", "识别实验室", "权限与系统", "开发者工具"
+            "概览", "语音识别", "输入方式", "权限"
     };
 
     // ---- 视觉 token ----
@@ -169,7 +169,7 @@ public class MainActivity extends Activity {
         navBox.addView(filler, new LinearLayout.LayoutParams(1, 0, 1f));
 
         TextView foot = new TextView(this);
-        foot.setText("本地识别 · 音频不出设备");
+        foot.setText("语音 · 数字键盘");
         foot.setTextColor(0xFF5B6779);
         foot.setTextSize(10);
         foot.setPadding(dp(22), dp(12), dp(12), dp(22));
@@ -186,10 +186,10 @@ public class MainActivity extends Activity {
         previewBox.addView(h);
 
         TextView hint = new TextView(this);
-        hint.setText("可在屏幕上任意拖动");
+        hint.setText("点胶囊右端键盘图标可切换到数字键盘");
         hint.setTextColor(SUB);
         hint.setTextSize(10);
-        hint.setPadding(0, dp(4), 0, dp(22));
+        hint.setPadding(0, dp(4), 0, dp(12));
         previewBox.addView(hint);
 
         FrameLayout holder = new FrameLayout(this);
@@ -198,49 +198,6 @@ public class MainActivity extends Activity {
         holder.addView(new VoicePadView(this), new FrameLayout.LayoutParams(w, hh));
         previewBox.addView(holder, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        TextView states = new TextView(this);
-        states.setText("\n\n状态");
-        states.setTextColor(SUB);
-        states.setTextSize(10);
-        previewBox.addView(states);
-
-        String[][] rows = {
-                {"空闲", "蓝色麦克风"},
-                {"录音", "红色 + 呼吸光"},
-                {"识别", "灰色"},
-                {"完成", "描边闪绿"},
-                {"异常", "琥珀色"},
-        };
-        for (String[] r : rows) {
-            LinearLayout line = new LinearLayout(this);
-            line.setOrientation(LinearLayout.HORIZONTAL);
-            line.setPadding(0, dp(7), 0, dp(7));
-
-            View dot = new View(this);
-            dot.setBackgroundColor(colorOfState(r[0]));
-            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(6), dp(6));
-            dlp.gravity = Gravity.CENTER_VERTICAL;
-            dlp.rightMargin = dp(10);
-            line.addView(dot, dlp);
-
-            TextView t = new TextView(this);
-            t.setText(r[0] + "  ·  " + r[1]);
-            t.setTextColor(SUB);
-            t.setTextSize(11);
-            line.addView(t);
-            previewBox.addView(line);
-        }
-    }
-
-    private int colorOfState(String name) {
-        switch (name) {
-            case "录音": return RED;
-            case "识别": return 0xFFA2ADBD;
-            case "完成": return GREEN;
-            case "异常": return AMBER;
-            default: return BRAND;
-        }
     }
 
     private void select(int idx) {
@@ -260,9 +217,8 @@ public class MainActivity extends Activity {
             case 0: pageOverview(); break;
             case 1: pageAsr(); break;
             case 2: pageInput(); break;
-            case 3: pageLab(); break;
-            case 4: pagePermissions(); break;
-            default: pageDev(); break;
+            case 3: pagePermissions(); break;
+            default: pageOverview(); break;
         }
         refresh();
     }
@@ -270,7 +226,7 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------- 页面
 
     private void pageOverview() {
-        bigTitle("运行状态", "一眼看清现在能不能用");
+        bigTitle("序言输入", "语音与数字键盘，按需切换");
 
         LinearLayout two = new LinearLayout(this);
         two.setOrientation(LinearLayout.HORIZONTAL);
@@ -287,32 +243,40 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f));
         two.addView(gap, glp);
 
-        // 右栏：面板预览（用 VoicePadView 真实绘制面板态）
+        // 右栏：胶囊预览（真实绘制，尺寸与悬浮窗一致）
         LinearLayout right = new LinearLayout(this);
         right.setOrientation(LinearLayout.VERTICAL);
         right.setBackground(roundBg(CARD, 16));
         right.setPadding(dp(18), dp(16), dp(18), dp(16));
 
         TextView rt = new TextView(this);
-        rt.setText("展开面板");
+        rt.setText("胶囊");
         rt.setTextColor(TEXT);
         rt.setTextSize(13);
         rt.setTypeface(Typeface.DEFAULT_BOLD);
         right.addView(rt);
 
         TextView rd = new TextView(this);
-        rd.setText("点胶囊上的 ⌃ 展开");
+        rd.setText("五键：录音 / 剪贴板 / 换行 / 删除 / 拖动把手");
         rd.setTextColor(SUB);
         rd.setTextSize(10);
-        rd.setPadding(0, dp(4), 0, dp(12));
+        rd.setLineSpacing(0, 1.4f);
+        rd.setPadding(0, dp(4), 0, dp(14));
         right.addView(rd);
 
         FrameLayout ph = new FrameLayout(this);
-        int pw = (int) (VoicePadView.PW * getResources().getDisplayMetrics().density);
-        int phh = (int) (VoicePadView.PH * getResources().getDisplayMetrics().density);
-        VoicePadView panelPreview = new VoicePadView(this);
-        ph.addView(panelPreview, new FrameLayout.LayoutParams(pw, phh));
+        int pw = (int) (VoicePadView.W * getResources().getDisplayMetrics().density);
+        int phh = (int) (VoicePadView.H * getResources().getDisplayMetrics().density);
+        VoicePadView capsulePreview = new VoicePadView(this);
+        ph.addView(capsulePreview, new FrameLayout.LayoutParams(pw, phh));
         right.addView(ph);
+
+        TextView tip = new TextView(this);
+        tip.setText("\n按住右侧把手可拖动\n双击空白收起键盘");
+        tip.setTextColor(SUB);
+        tip.setTextSize(10);
+        tip.setLineSpacing(0, 1.5f);
+        right.addView(tip);
 
         two.addView(right, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
@@ -456,19 +420,15 @@ public class MainActivity extends Activity {
     }
 
     private void pageInput() {
-        bigTitle("输入与外观", "胶囊的形态与操作方式");
-        sub("形态");
-        note("216 × 56dp，圆角 28dp，四个按钮：录音 / 换行 / 删除 / 展开箭头。");
-        sub("位置");
-        note("可拖到屏幕任意位置，松手记住；下次唤醒、切换输入法都回到原位。");
-        sub("展开面板");
-        note("点箭头展开二级面板（撤销 / 历史 / 语言 / 设置）；长按箭头直接进入拖动。");
-        sub("换行");
-        note("· DSH / Harness 类应用：发 Shift+Enter，只换行不发送\n"
-                + "· 其它应用：插入换行字符\n"
-                + "· 任何情况都不模拟裸 Enter，识别结束也不会自动补回车");
-        sub("删除");
-        note("· 单击退一个字\n· 长按连续退\n· 按住上滑 28dp 进入清空预备态，松手清空");
+        bigTitle("输入方式", "语音与数字键盘随时切换");
+        sub("键盘入口");
+        note("使用输入法时，点胶囊右端的小键盘图标打开数字键盘；点键盘顶部「语音」返回胶囊。键盘可输入数字与常用符号，不提供中文拼音或双拼。");
+        sub("数字与符号");
+        note("支持 0–9、@、点、横线、下划线、加号、斜线、退格和换行。键盘保持输入框焦点，不会自动发送。");
+        sub("语音胶囊");
+        note("麦克风录音；剪贴板点按粘贴、长按查看历史；↵ 安全换行；⌫ 删除；把手拖动。双击空白收起。");
+        sub("隐私");
+        note("键盘按键直接写入当前输入框，不保存输入内容、不上传。云端语音识别仍按「语音识别」页的云端设置处理。");
     }
 
     private void pageLab() {
@@ -507,16 +467,11 @@ public class MainActivity extends Activity {
                         if (imm != null) imm.showInputMethodPicker();
                     } catch (Throwable ignored) { }
                 }));
-        note("没有悬浮窗权限也能用，但胶囊只能待在底部、且会把画面顶起来。");
+        note("悬浮窗权限用于显示可拖动的语音胶囊与数字键盘。关闭后可在系统输入法区域使用。");
     }
 
     private void pageDev() {
-        bigTitle("开发者工具", "参数与调试入口");
-        sub("设计参数");
-        note("胶囊 216×56dp · 圆角 28dp · 四键 44/40/40/34dp\n"
-                + "面板 252×192dp · 圆角 24dp\n"
-                + "主蓝 #60A5FA · 录音红 #FF6969 · 中性灰 #A2ADBD\n"
-                + "警示琥珀 #FBBF24 · 成功绿 #22C55E");
+        bigTitle("高级", "调试入口");
         sub("AI 注入通道");
         note("本输入法是当前输入法且输入框有焦点时，可用一条广播把文本直接写进去：");
         tvCmd = card(commitCmd());
