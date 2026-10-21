@@ -12,7 +12,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 WORK="${WORK:-$HOME/vim-build}"
 DIST_OUT="$ROOT/dist"
-VER="1.0.0"
+VER="1.0.1"
+VCODE="2"
 APK="Xuyan-${VER}.apk"
 
 export PREFIX="${PREFIX:-/data/data/com.dsharnessmobile.shell/files/usr}"
@@ -52,7 +53,7 @@ step "3 aapt2 link"
 aapt2 link -o "$BUILD/base.apk" -I "$ANDROID_JAR" \
   --manifest "$APP/AndroidManifest.xml" --java "$BUILD/gen" \
   --min-sdk-version 26 --target-sdk-version 34 \
-  --version-code 1 --version-name "$VER" "$BUILD/res.zip"
+  --version-code "$VCODE" --version-name "$VER" "$BUILD/res.zip"
 
 step "4 javac"
 mkdir -p "$BUILD/classes"
