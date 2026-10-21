@@ -74,6 +74,8 @@ public class AsrEngine {
     private volatile boolean loading;
     private volatile String loadError;
     private volatile boolean ready;
+    /** 本地术语纠正（不联网、不调用大模型） */
+    private volatile TermFix termFix;
 
     private AsrEngine(Context c) {
         this.ctx = c.getApplicationContext();
@@ -100,9 +102,107 @@ public class AsrEngine {
         return in;                       // 都没有时默认指向内部，便于导错提示
     }
 
+    /** Qwen3-ASR 模型目录（三件套 onnx + tokenizer 子目录）。与 SenseVoice 并存，互不覆盖。 */
+    public File qwen3Dir() {
+        File in = new File(ctx.getFilesDir(), "models-qwen3");
+        if (new File(in, "decoder.int8.onnx").isFile()) return in;
+        File ex = new File(ctx.getExternalFilesDir(null), "models-qwen3");
+        if (new File(ex, "decoder.int8.onnx").isFile()) return ex;
+        return in;
+    }
+
+    /** Qwen3 模型是否完整（缺一个文件就回落 SenseVoice，避免输入法直接不可用）。 */
+    public boolean qwen3Present() {
+        File d = qwen3Dir();
+        return new File(d, "conv_frontend.onnx").isFile()
+                && new File(d, "encoder.int8.onnx").isFile()
+                && new File(d, "decoder.int8.onnx").isFile()
+                && new File(d, "tokenizer").isDirectory();
+    }
+
     public boolean modelPresent() {
+        if (qwen3Present()) return true;
         File d = modelDir();
         return new File(d, "model.int8.onnx").isFile() && new File(d, "tokens.txt").isFile();
+    }
+
+    /**
+     * 读取自定义术语表（应用私有目录 terms.txt）。
+     * 格式与 TermFix 内置词表一致：规范写法 TAB 变体1|变体2…
+     * 不存在或读失败时返回 null，回落到内置词表。
+     */
+    private String readTermsFile() {
+        try {
+            File f = new File(ctx.getFilesDir(), "terms.txt");
+            if (!f.isFile() || f.length() <= 0 || f.length() > 256 * 1024) return null;
+            byte[] buf = new byte[(int) f.length()];
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            try {
+                int off = 0;
+                while (off < buf.length) {
+                    int n = in.read(buf, off, buf.length - off);
+                    if (n < 0) break;
+                    off += n;
+                }
+            } finally {
+                in.close();
+            }
+            return new String(buf, "UTF-8");
+        } catch (Throwable e) {
+            Log.w(TAG, "读取 terms.txt 失败，使用内置词表", e);
+            return null;
+        }
+    }
+
+    private TermFix terms() {
+        TermFix t = termFix;
+        if (t != null) return t;
+        synchronized (this) {
+            if (termFix == null) termFix = new TermFix(readTermsFile());
+            return termFix;
+        }
+    }
+
+    /**
+     * 最近识别记录（仅本机，应用私有目录，最多 30 条）。
+     * 用途：统计专名错误率、验证 TermFix 是否真的把错词改对了。
+     * 不上传、不参与任何网络请求。
+     */
+    private void record(String raw, String fixed, long ms) {
+        try {
+            File f = new File(ctx.getFilesDir(), "asr-recent.tsv");
+            List<String> keep = new ArrayList<>();
+            if (f.isFile()) {
+                java.io.BufferedReader r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
+                try {
+                    String line;
+                    while ((line = r.readLine()) != null) if (!line.isEmpty()) keep.add(line);
+                } finally {
+                    r.close();
+                }
+            }
+            keep.add(System.currentTimeMillis() + "\t" + ms + "\t" + language
+                    + "\t" + oneLine(raw) + "\t" + oneLine(fixed));
+            while (keep.size() > 30) keep.remove(0);
+            java.io.BufferedWriter w = new java.io.BufferedWriter(
+                    new java.io.OutputStreamWriter(new java.io.FileOutputStream(f), "UTF-8"));
+            try {
+                for (String line : keep) {
+                    w.write(line);
+                    w.write("\n");
+                }
+            } finally {
+                w.close();
+            }
+        } catch (Throwable e) {
+            Log.w(TAG, "写识别记录失败", e);
+        }
+    }
+
+    private static String oneLine(String s) {
+        if (s == null) return "";
+        return s.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
     }
 
     public boolean isReady() { return ready; }
@@ -132,17 +232,38 @@ public class AsrEngine {
     }
 
     private OfflineRecognizer build() {
-        File d = modelDir();
+        boolean useQwen3 = qwen3Present();
+        File d = useQwen3 ? qwen3Dir() : modelDir();
         String model = new File(d, "model.int8.onnx").getAbsolutePath();
         String tokens = new File(d, "tokens.txt").getAbsolutePath();
 
         FeatureConfig feat = new FeatureConfig(SAMPLE_RATE, 80, 0f);
 
-        OfflineSenseVoiceModelConfig sv = new OfflineSenseVoiceModelConfig(
-                model,          // model
-                language,       // language：auto / zh / en / ja / ko / yue
-                true,           // useInverseTextNormalization：把「二零二六」规整成「2026」
-                new QnnConfig("", "", ""));
+        OfflineSenseVoiceModelConfig sv = useQwen3
+                ? new OfflineSenseVoiceModelConfig()
+                : new OfflineSenseVoiceModelConfig(
+                        model,          // model
+                        language,       // language：auto / zh / en / ja / ko / yue
+                        true,           // useInverseTextNormalization
+                        new QnnConfig("", "", ""));
+
+        OfflineQwen3AsrModelConfig q3 = useQwen3
+                ? new OfflineQwen3AsrModelConfig(
+                        new File(d, "conv_frontend.onnx").getAbsolutePath(),
+                        new File(d, "encoder.int8.onnx").getAbsolutePath(),
+                        new File(d, "decoder.int8.onnx").getAbsolutePath(),
+                        new File(d, "tokenizer").getAbsolutePath(),
+                        512,        // maxTotalLen（模型上限）
+                        200,        // maxNewTokens
+                        1e-6f,      // temperature
+                        0.8f,       // topP
+                        42,         // seed
+                        "")         // hotwords
+                : new OfflineQwen3AsrModelConfig();
+
+        String tokensUsed = useQwen3 ? "" : tokens;
+        int threads = useQwen3 ? 4 : 2;
+        Log.i(TAG, "使用模型：" + (useQwen3 ? "Qwen3-ASR(0.6B)" : "SenseVoice") + " @" + d);
 
         // 注意：OfflineModelConfig 共 25 个参数，顺序已从字节码 putfield 逐个核对。
         // 未使用的模型槽位必须传**空对象**：Kotlin 侧这些参数声明为非空，
@@ -162,16 +283,16 @@ public class AsrEngine {
                 new OfflineOmnilingualAsrCtcModelConfig(), // 11 omnilingual
                 new OfflineMedAsrCtcModelConfig(),       // 12 medasr
                 new OfflineFunAsrNanoModelConfig(),      // 13 funasrNano
-                new OfflineQwen3AsrModelConfig(),        // 14 qwen3Asr
+                q3,                                      // 14 qwen3Asr
                 new OfflineFireRedAsrCtcModelConfig(),   // 15 fireRedAsrCtc
                 new OfflineCanaryModelConfig(),          // 16 canary
                 new OfflineCohereTranscribeModelConfig(),// 17 cohereTranscribe
                 "",     // 18 teleSpeech
-                2,      // 19 numThreads
+                threads,// 19 numThreads
                 false,  // 20 debug
                 "cpu",  // 21 provider
                 "",     // 22 modelType
-                tokens, // 23 tokens  ← 词表路径
+                tokensUsed, // 23 tokens  ← 词表路径（Qwen3 不用）
                 "",     // 24 modelingUnit
                 "");    // 25 bpeVocab
 
@@ -203,6 +324,7 @@ public class AsrEngine {
         if (samples == null || samples.length == 0) return "";
         OfflineRecognizer r = rec;
         if (r == null) return "";
+        long t0 = System.currentTimeMillis();
 
         float[] pcm = preprocess(samples);
 
@@ -226,9 +348,39 @@ public class AsrEngine {
             if (sb.length() > 0 && !endsWithPunct(sb)) sb.append('，');
             sb.append(t);
         }
-        return cleanPunct(sb.toString());
+        String raw = cleanPunct(sb.toString());
+        String fixed = terms().apply(raw);
+        record(raw, fixed, System.currentTimeMillis() - t0);
+        return fixed;
     }
 
+    /**
+     * 仅供「云端/本地对照采集」使用：跑一遍本地模型拿原始文本，
+     * 不做 TermFix、不写 asr-recent，避免污染日常记录。
+     */
+    public String transcribeForCompare(float[] samples, int sampleRate) {
+        if (samples == null || samples.length == 0) return "";
+        OfflineRecognizer r = rec;
+        if (r == null) return "";
+        float[] pcm = preprocess(samples);
+        List<float[]> segs;
+        if (pcm.length <= 30 * sampleRate) {
+            segs = new ArrayList<>(1);
+            segs.add(pcm);
+        } else {
+            segs = split(pcm, sampleRate);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (float[] seg : segs) {
+            String t = one(r, seg, sampleRate);
+            if (t == null) continue;
+            t = t.trim();
+            if (t.isEmpty()) continue;
+            if (sb.length() > 0 && !endsWithPunct(sb)) sb.append('，');
+            sb.append(t);
+        }
+        return cleanPunct(sb.toString());
+    }
     private static boolean endsWithPunct(StringBuilder sb) {
         if (sb.length() == 0) return false;
         char c = sb.charAt(sb.length() - 1);

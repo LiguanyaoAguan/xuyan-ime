@@ -63,6 +63,22 @@ public class AsrSettings {
         return (v == null || v.trim().isEmpty()) ? DEF_LANG : v.trim();
     }
 
+    /**
+     * 本机离线引擎的语言模式（与云端接口的 language 是两件事）。
+     * auto 让 SenseVoice 自己判断；zh/en/ja/ko/yue 强制指定。
+     * 强制 zh 时英文专名容易被音译（DeepSeek → dP），这是可调项。
+     */
+    public static final String K_LOCAL_LANG = "local_language";
+
+    public static String localLanguage(Context c) {
+        String v = sp(c).getString(K_LOCAL_LANG, "zh");
+        return (v == null || v.trim().isEmpty()) ? "zh" : v.trim();
+    }
+
+    public static void setLocalLanguage(Context c, String v) {
+        sp(c).edit().putString(K_LOCAL_LANG, v == null ? "zh" : v.trim()).apply();
+    }
+
     public static boolean polishEnabled(Context c) {
         return "1".equals(sp(c).getString(K_POLISH, "0"));
     }

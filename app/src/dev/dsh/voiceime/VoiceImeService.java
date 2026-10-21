@@ -79,6 +79,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     private String historyTargetPackage;
     private String recTargetPkg;
     private volatile boolean streamingOn;   // 本次录音是否启用了流式草稿
+    private volatile boolean forceCloudTake; // 本次录音是否由「长按麦克风」发起 → 强制走云端
     private volatile String draftTarget = "";   // 模型最新给的草稿全文
     private int draftShown;                     // 已经落定（commitText）的字符数
     private int draftWritten;                   // 本次草稿总共写进输入框的字符数
@@ -96,6 +97,8 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
         super.onCreate();
         Log.i(TAG, "IME onCreate");
         asr = AsrEngine.get(this);
+        // 应用上次选定的本机识别语言（默认 zh）。强制 zh 时英文专名容易被音译。
+        asr.setLanguage(AsrSettings.localLanguage(this));
         // 预热：切到本输入法就把 239MB 模型后台载入，用户按麦克风时无需等待
         asr.warmUp();
         registerCommitReceiver();
@@ -1257,6 +1260,51 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
         }
     }
 
+    /**
+     * 采集期对照记录：云端已上屏，这里后台再跑一遍本地 SenseVoice，把两份结果记进
+     * asr-compare.tsv（ts / 时长秒 / 云端 / 本地），只记账不上屏。
+     * 硬上限 3000 秒音频，累计到达后自动停止，避免悄悄产生 API 费用。
+     */
+    private void logCompare(float[] pcm, String cloudText) {
+        try {
+            if (pcm == null || pcm.length == 0) return;
+            if (cloudText == null || cloudText.trim().isEmpty()) return;
+            final int dur = Math.max(1, pcm.length / AsrEngine.SAMPLE_RATE);
+            SharedPreferences p = getSharedPreferences("asr_cfg", MODE_PRIVATE);
+            final int used = p.getInt("compare_secs", 0);
+            if (used >= 3000) return;
+            p.edit().putInt("compare_secs", used + dur).apply();
+
+            final String cloudTextSafe = oneLine(cloudText);
+            final float[] audio = pcm;
+            new Thread(() -> {
+                try {
+                    AsrEngine e = AsrEngine.get(VoiceImeService.this);
+                    if (!e.isReady()) return;
+                    String local = e.transcribeForCompare(audio, AsrEngine.SAMPLE_RATE);
+                    String line = System.currentTimeMillis() + "\t" + dur + "\t"
+                            + cloudTextSafe + "\t" + oneLine(local) + "\n";
+                    java.io.File f = new java.io.File(getFilesDir(), "asr-compare.tsv");
+                    java.io.FileOutputStream out = new java.io.FileOutputStream(f, true);
+                    try {
+                        out.write(line.getBytes("UTF-8"));
+                    } finally {
+                        out.close();
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "对照记录失败", t);
+                }
+            }, "asr-compare").start();
+        } catch (Throwable t) {
+            Log.w(TAG, "对照开关异常", t);
+        }
+    }
+
+    private static String oneLine(String s) {
+        if (s == null) return "";
+        return s.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').trim();
+    }
+
     private void doCommit(String text, boolean replace) {
         // 焦点保护：录音期间切到了别的 App，就不要再写，避免把话写到错误的地方
         String nowPkg = currentPkg();
@@ -1295,7 +1343,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     public void onMicToggle() {
         if (busy) return;
         if (recorder != null && recorder.isRecording()) stopAndTranscribe();
-        else startRecord();
+        else { forceCloudTake = false; startRecord(); }   // 单击 = 按设置里的引擎（默认本地）
     }
 
     /** 按住说话：按下就开始录 */
@@ -1303,6 +1351,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
     public void onMicHoldStart() {
         if (busy) return;
         if (recorder != null && recorder.isRecording()) return;   // 已经在录（切换式）
+        forceCloudTake = true;                                    // 按住说话 = 强制云端
         startRecord();
     }
 
@@ -1356,7 +1405,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
         StreamingAsr st = StreamingAsr.get(this);
         String lang = AsrEngine.get(this).language();
         boolean langOk = "zh".equals(lang) || "auto".equals(lang);
-        streamingOn = !AsrSettings.isCloud(this) && st.modelPresent() && langOk;
+        streamingOn = st.modelPresent() && langOk;   // 云端/本地都开草稿，否则用户会觉得"没在听"
         draftTarget = "";
         draftShown = 0;
         draftWritten = 0;
@@ -1378,7 +1427,7 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
             setPadState(VoicePadView.S_IDLE);
             return;
         }
-        final boolean cloud = AsrSettings.isCloud(this);
+        final boolean cloud = forceCloudTake || AsrSettings.isCloud(this);   // 长按强制云端，单击按设置
         final String draft;
         if (streamingOn) {
             draft = StreamingAsr.get(this).finish();
@@ -1398,6 +1447,8 @@ public class VoiceImeService extends InputMethodService implements VoicePadView.
                 if (cloud) {
                     // 云端整段送，不切句：模型自带 VAD 和标点，切碎反而更差
                     text = CloudAsr.transcribe(VoiceImeService.this, pcm, AsrEngine.SAMPLE_RATE);
+                    // 采集期对照记录：云端上屏，同时后台跑一遍本地模型，只记账不上屏
+                    logCompare(pcm, text);
                 } else {
                     AsrEngine e = AsrEngine.get(VoiceImeService.this);
                     if (!e.isReady() && e.isLoading()) {

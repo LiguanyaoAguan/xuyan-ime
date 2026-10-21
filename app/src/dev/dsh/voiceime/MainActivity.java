@@ -388,6 +388,7 @@ public class MainActivity extends Activity {
         tvEngine.setTextSize(12);
         row(subtleButton("本机离线", v -> { AsrSettings.setEngine(this, "local"); refresh(); }),
                 subtleButton("云端 API", v -> { AsrSettings.setEngine(this, "cloud"); refresh(); }));
+        note("单击麦克风 = 按这里的设置；按住麦克风说话 = 强制走云端（术语/英文更准，按次计费）。两种方式都会显示边说边出的草稿。");
 
         sub("云端接口（可选）");
         etBase = edit(AsrSettings.baseUrl(this), "https://api.xiaomimimo.com/v1", false);
@@ -429,6 +430,37 @@ public class MainActivity extends Activity {
         note("麦克风录音；剪贴板点按粘贴、长按查看历史；↵ 安全换行；⌫ 删除；把手拖动。双击空白收起。");
         sub("隐私");
         note("键盘按键直接写入当前输入框，不保存输入内容、不上传。云端语音识别仍按「语音识别」页的云端设置处理。");
+
+        sub("本地识别语言");
+        final String[] langs = {"zh", "auto", "en", "ja", "ko", "yue"};
+        Button langBtn = subtleButton("当前：" + AsrSettings.localLanguage(this), null);
+        langBtn.setOnClickListener(v -> {
+            String cur = AsrSettings.localLanguage(this);
+            int i = 0;
+            for (int k = 0; k < langs.length; k++) if (langs[k].equals(cur)) i = k;
+            final String next = langs[(i + 1) % langs.length];
+            AsrSettings.setLocalLanguage(this, next);
+            langBtn.setText("当前：" + next);
+            toast("本机识别语言：" + next);
+            new Thread(() -> AsrEngine.get(this).setLanguage(next), "asr-lang").start();
+        });
+        contentBox.addView(langBtn, lp());
+        note("auto 让模型自己判断；英文专名多时 auto 往往比 zh 更少音译（例如少出现「dP 哈尼斯」）。切换后模型会重新加载一次。");
+
+        sub("专名纠正（本地）");
+        note("识别结果会按本地词表把常见误识别改成规范写法，例如「dP 哈尼斯」→「DeepSeek Harness」、「哈尼斯」→「Harness」。纯字符串规则，不联网、不调用大模型。\n高级用法：在应用私有目录放 terms.txt 可覆盖内置词表，格式为「规范写法<TAB>变体1|变体2」。");
+
+        sub("识别记录（仅本机）");
+        note("最近 30 条识别结果保存在应用私有目录 files/asr-recent.tsv，用于统计专名错误率；不联网、不上传。");
+        contentBox.addView(subtleButton("清空识别记录", v -> {
+            try {
+                java.io.File f = new java.io.File(getFilesDir(), "asr-recent.tsv");
+                if (f.isFile() && !f.delete()) { toast("清空失败"); return; }
+                toast("已清空识别记录");
+            } catch (Throwable e) {
+                toast("清空失败");
+            }
+        }), lp());
     }
 
     private void pageLab() {
